@@ -1,63 +1,89 @@
-# Custom Database Template for the MiSTer Downloader
+# MiSTer Monitor — Downloader Database
 
-By following these instructions, you'll create your own [Custom Database for the MiSTer Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer/blob/main/docs/custom-databases.md). This database can be integrated in MiSTer FPGA by just editing the `downloader.ini` file at the root of the SD.
+This is the [MiSTer Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer)
+custom database for the [MiSTer FPGA Monitor](https://github.com/chipster6502/MiSTer_monitor).
 
-Once your database is up, adding files to it is very simple. You'll only have to upload files to your repository on GitHub, and after that, your users will fetch these files directly in their devices, by just running *downloader* or *update_all*.
+It lets users install and update the **MiSTer-side server component**
+(`mister_status_server.py` and `start_monitor.sh`) automatically through
+the standard MiSTer Downloader workflow, without manually copying files
+or editing scripts.
 
-## How to generate your own Custom Database for the MiSTer Downloader:
-1. Make sure you are logged in into your GitHub account. Or register a new account if you don't have any yet.
-2. Then click on
-    <a style="margin-top:100px;" href="https://github.com/theypsilon/DB-Template_MiSTer/generate">
-        <img src="https://img.shields.io/badge/Use_this_template-2ea44f" 
-            alt="Use this template"
-            title="Create repository from this template"></a>
-button to create your own public Custom Database repository on GitHub.
-3. After less than 5 minutes, you're database file will be generated at `https://raw.githubusercontent.com/<YOUR GITHUB USER>/<YOUR GITHUB REPOSITORY>/db/db.json.zip` (replacing the <> fields accordingly) and will be ready to be used. For example, if your GitHub user is `jose` and your repository name is `game_wallpapers`, the url will be: `https://raw.githubusercontent.com/jose/game_wallpapers/db/db.json.zip`
-4. To integrate it in a MiSTer device, download the following file: `https://raw.githubusercontent.com/<YOUR GITHUB USER>/<YOUR GITHUB REPOSITORY>/db/downloader_<YOUR GITHUB USER>_<YOUR GITHUB REPOSITORY>.zip`.
-Then extract the `.ini` file from it and place it in the root of the SD card.
-5. After that, run *downloader* or *update_all* as usual. It will try to fetch the files from your newly created database. If your database is still empty -which is your case if you followed these instructions-, obviously it won't download any file yet, but it will show up in the logs. For adding files to the database check the next section.
+## What this database installs
 
-## How to add files to your already working Custom Database:
+| Path on MiSTer | Description |
+|---|---|
+| `Scripts/start_monitor.sh` | Launcher script visible in the MiSTer Scripts menu (`start`, `stop`, `restart`, `status`). |
+| `Scripts/.config/mister_monitor/mister_status_server.py` | The HTTP server that runs on the MiSTer and exposes core/game state to the second screen. |
 
-Once you have your database up and running (check previous section to figure out how to set it up), adding files is very straightforward.
+## Installation
 
-Just upload any file to your repository by using GitHub UI (Add File > Upload files), or via git. Once the files show up in your repository, they'll also be added to your database automatically. You may see the *Actions* tab in your repository to see how the automation did its magic if you are curious. **NEW:** If you want to add files without uploading them to the repository, you may use the [external_files.csv](external_files.csv) file for that.
+There are two ways to add this database to your MiSTer.
 
-A couple of things to consider when uploading files:
+### Easiest: drop-in database
 
-- When a user fetches the files via *downloader* or *update_all*, the downloaded file structure will mirror 1:1 the file structure you have in your repository at GitHub. This means, if you have a folder `_Cores/` containing some files in your repository, an identical `_Cores` folder will show up in MiSTer containing the exact same files.
+Download the drop-in database file:
 
-- The files `README.md`, `LICENSE`, and the `.github` folder won't be included in your database. Just ignore them, they won't be installed in the devices. The file `external_files.csv` won't show up on your device either, but the files listed inside it will.
+[`downloader_chipster6502_MiSTer_monitor_DB.zip`](https://raw.githubusercontent.com/chipster6502/MiSTer_monitor_DB/db/downloader_chipster6502_MiSTer_monitor_DB.zip)
 
-- You may upload as many files as you want as long as they don't violate GitHub constraints (100mb is max size per file).
+Extract the `.ini` file inside and place it next to `downloader.ini`
+in the root of your MiSTer SD card (`/media/fat/`). That's it — the
+next time you run *Update All* or *Downloader* from your MiSTer, the
+files will be downloaded automatically.
 
-- You should avoid full path clashes between your files and the files from other databases so that your users don't run into issues when using multiple databases at the same time.
+### Manual: edit downloader.ini
 
-## How your users will integrate your Custom Database in their MiSTers:
-
-Your users may integrate your database in two different ways.
-
-The easiest option is to use the generated drop-in database. Assuming GitHub user is "jose" and the repository is called "game_wallpapers", your users may download:
-
-`https://raw.githubusercontent.com/jose/game_wallpapers/db/downloader_jose_game_wallpapers.zip`
-
-After that, they just have to extract `downloader_jose_game_wallpapers.ini` from that ZIP file and place it next to `downloader.ini` in the root of the SD card.
-
-If they prefer to do it manually instead, they may add the following lines to the bottom of `downloader.ini`:
+Add the following lines to the bottom of `/media/fat/downloader.ini`:
 
 ```ini
-[jose/game_wallpapers]
-db_url = https://raw.githubusercontent.com/jose/game_wallpapers/db/db.json.zip
+[chipster6502/MiSTer_monitor_DB]
+db_url = https://raw.githubusercontent.com/chipster6502/MiSTer_monitor_DB/db/db.json.zip
 ```
 
-This needs to be done just once by your users. After that, whenever they run *downloader* or *update_all* they'll also be installing your updated files.
+Then run *Update All* or *Downloader* as usual.
 
-## Modifying README.md
+## After installation
 
-After you have your own repository based on this template, a good idea would be to edit your `README.md` describing the content of your database and how to use it. That way users will learn about your Database and will integrate it into their MiSTer's easily.
+Once the files are downloaded, you still need to do a few one-time
+configuration steps on the MiSTer:
 
-Feel free to remove any reference to the original template there.
+1. Make `start_monitor.sh` executable (the Downloader preserves
+   permissions, but if it doesn't work, run `chmod +x /media/fat/Scripts/start_monitor.sh`).
+2. Add this line to `/media/fat/linux/user-startup.sh` so the server
+   starts automatically on boot:
+```bash
+   /media/fat/Scripts/start_monitor.sh start
+```
+3. Enable `log_file_entry=1` in `/media/fat/MiSTer.ini` (under the
+   `[MiSTer]` section). This is required for the server to detect
+   core and game changes.
+4. Reboot the MiSTer or start the server manually:
+```bash
+   /media/fat/Scripts/start_monitor.sh start
+```
 
-## DB Inspector
+For the **Tab5 firmware** (which is flashed to the device, not stored on
+the MiSTer), follow the instructions in the
+[main repository README](https://github.com/chipster6502/MiSTer_monitor#tab5-side).
 
-You may use this tool to inspect the resulting database easily: https://theypsilon.github.io/DB-Inspector_MiSTer
+## Updates
+
+Whenever a new version of the server-side scripts is released in the
+main repository, this database is updated to track it. The next time
+your MiSTer runs the Downloader, it picks up the new files
+automatically.
+
+## Uninstallation
+
+Remove the line you added to `downloader.ini`, then run *Update All* or
+*Downloader* again — the Downloader detects the removed entry and
+cleans up the files it had installed from this database.
+
+## Related
+
+- [Main repository (firmware, documentation, releases)](https://github.com/chipster6502/MiSTer_monitor)
+- [MiSTer Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer)
+- [DB Template by theypsilon](https://github.com/theypsilon/DB-Template_MiSTer) (the template used to generate this database)
+
+## License
+
+MIT — same as the main repository.
