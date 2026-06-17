@@ -3,17 +3,22 @@
 This is the [MiSTer Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer)
 custom database for the [MiSTer FPGA Monitor](https://github.com/chipster6502/MiSTer_monitor).
 
-It lets users install and update the **MiSTer-side server component**
-(`mister_status_server.py` and `start_monitor.sh`) automatically through
-the standard MiSTer Downloader workflow, without manually copying files
-or editing scripts.
+It installs and updates the **MiSTer-side server component** automatically
+through the standard MiSTer Downloader workflow, without manually copying
+files. A one-time setup script then handles all system configuration for you.
+
+> For the full installation guide — including the display firmware — see
+> [`installation.md`](https://github.com/chipster6502/MiSTer_monitor/blob/main/docs/installation.md)
+> in the main repository. This page only covers adding the database.
 
 ## What this database installs
 
 | Path on MiSTer | Description |
 |---|---|
-| `Scripts/start_monitor.sh` | Launcher script visible in the MiSTer Scripts menu (`start`, `stop`, `restart`, `status`). |
-| `Scripts/.config/mister_monitor/mister_status_server.py` | The HTTP server that runs on the MiSTer and exposes core/game state to the second screen. |
+| `Scripts/start_monitor.sh` | Server launcher (`start`, `stop`, `restart`, `status`), visible in the Scripts menu. |
+| `Scripts/MiSTer_Monitor_setup.sh` | One-time setup: enables the launcher, auto-start, and `log_file_entry`, then starts the server. |
+| `Scripts/MiSTer_Monitor_uninstall.sh` | Deactivates the monitor (stops the server, removes auto-start) while keeping the files in place. |
+| `Scripts/.config/mister_monitor/mister_status_server.py` | The HTTP server that runs on the MiSTer and exposes core/game state to the display. |
 
 ## Installation
 
@@ -26,9 +31,7 @@ Download the drop-in database file:
 [`downloader_chipster6502_MiSTer_monitor_DB.zip`](https://raw.githubusercontent.com/chipster6502/MiSTer_monitor_DB/db/downloader_chipster6502_MiSTer_monitor_DB.zip)
 
 Extract the `.ini` file inside and place it next to `downloader.ini`
-in the root of your MiSTer SD card (`/media/fat/`). That's it — the
-next time you run *Update All* or *Downloader* from your MiSTer, the
-files will be downloaded automatically.
+in the root of your MiSTer SD card (`/media/fat/`).
 
 ### Manual: edit downloader.ini
 
@@ -39,44 +42,39 @@ Add the following lines to the bottom of `/media/fat/downloader.ini`:
 db_url = https://raw.githubusercontent.com/chipster6502/MiSTer_monitor_DB/db/db.json.zip
 ```
 
-Then run *Update All* or *Downloader* as usual.
+## Installing and configuring
 
-## After installation
+1. Run *Update All* or *Downloader* from your MiSTer Scripts menu. The four
+   files above are downloaded automatically.
+2. Back in the Scripts menu, run **`MiSTer_Monitor_setup`** once. It makes the
+   launcher executable, enables auto-start on boot, ensures `log_file_entry=1`
+   in `MiSTer.ini`, and starts the server. It is safe to run again at any time.
 
-Once the files are downloaded, you still need to do a few one-time
-configuration steps on the MiSTer:
-
-1. Make `start_monitor.sh` executable (the Downloader preserves
-   permissions, but if it doesn't work, run `chmod +x /media/fat/Scripts/start_monitor.sh`).
-2. Add this line to `/media/fat/linux/user-startup.sh` so the server
-   starts automatically on boot:
-```bash
-   /media/fat/Scripts/start_monitor.sh start
-```
-3. Enable `log_file_entry=1` in `/media/fat/MiSTer.ini` (under the
-   `[MiSTer]` section). This is required for the server to detect
-   core and game changes.
-4. Reboot the MiSTer or start the server manually:
-```bash
-   /media/fat/Scripts/start_monitor.sh start
-```
-
-For the **Tab5 firmware** (which is flashed to the device, not stored on
-the MiSTer), follow the instructions in the
-[main repository README](https://github.com/chipster6502/MiSTer_monitor#tab5-side).
+That's it. For the display firmware (flashed to the device, not stored on the
+MiSTer) and the rest of the setup, see the
+[main installation guide](https://github.com/chipster6502/MiSTer_monitor/blob/main/docs/installation.md).
 
 ## Updates
 
-Whenever a new version of the server-side scripts is released in the
-main repository, this database is updated to track it. The next time
-your MiSTer runs the Downloader, it picks up the new files
-automatically.
+Whenever the server-side files change in the main repository, this database is
+updated to track them. The next time your MiSTer runs the Downloader, it picks
+up the new versions automatically. You do **not** need to run the setup again
+after an update.
 
 ## Uninstallation
 
-Remove the line you added to `downloader.ini`, then run *Update All* or
-*Downloader* again — the Downloader detects the removed entry and
-cleans up the files it had installed from this database.
+Run **`MiSTer_Monitor_uninstall`** from the Scripts menu. This *deactivates*
+the monitor — it stops the server and removes the auto-start entry, but leaves
+the files in place so you can re-enable it later by running
+`MiSTer_Monitor_setup` again (no re-download needed).
+
+To remove it **completely**, after running the uninstall script also delete
+the drop-in `downloader_chipster6502_MiSTer_monitor_DB.ini` from the root of
+your SD card, so the Downloader stops tracking it.
+
+> `log_file_entry=1` in `MiSTer.ini` is left untouched by the uninstall
+> script, since other tools may rely on it. Set it back to `0` manually if
+> you want.
 
 ## Related
 
