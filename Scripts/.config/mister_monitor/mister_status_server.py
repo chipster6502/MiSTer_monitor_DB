@@ -16,6 +16,7 @@ import hashlib
 import zlib
 import zipfile
 import io
+import socket
 from urllib.parse import urlparse
 
 def _load_names_txt():
@@ -36,7 +37,7 @@ def _load_names_txt():
                         names[key] = value
         print(f"✅ names.txt loaded: {len(names)} entries")
     except FileNotFoundError:
-        print("ℹ️ names.txt not found, using CORE_NAME_MAPPING only")
+        print("ℹ️ names.txt not found - this is normal; using raw core names.")
     except Exception as e:
         print(f"⚠️ Error reading names.txt: {e}")
     return names
@@ -230,6 +231,11 @@ import threading
 # ---------------------------------------------------------------------------
 _state_lock = threading.Lock()
 
+# Serializes ROM-detail computation so a firmware retry can't start a second
+# hash/CRC while the first is still running (the two would then fight over SD and
+# CPU). A second caller blocks here, then picks up the cache the first one wrote.
+_rom_details_compute_lock = threading.Lock()
+
 _state = {
     'core':              'Menu',   # friendly name — used for display, image lookup, and ScreenScraper mapping
     'system_name':       'Menu',   # alias of 'core' (same value); kept for backward compatibility
@@ -257,6 +263,22 @@ _WATCHED_FILES = [
     '/tmp/STARTPATH',   # arcade ROM path — needed to detect arcade game changes
 ]
 
+def _ensure_watched_files():
+    """
+    inotifywait aborts entirely if ANY watched path is missing. On setups
+    without MiSTer Remote, /tmp/ACTIVEGAME (and others) may never be created,
+    which traps the watcher in an endless restart loop and detection never
+    runs. Create any missing target as an empty file so the watch can attach;
+    MiSTer overwrites it with real content the moment it writes.
+    """
+    for path in _WATCHED_FILES:
+        try:
+            if not os.path.exists(path):
+                open(path, 'a').close()
+                print(f"📄 Created missing watch target: {path}")
+        except Exception as e:
+            print(f"⚠️ Could not create {path}: {e}")
+
 def _is_known_non_arcade(corename):
     """Returns True if corename belongs to a known non-arcade system."""
     return (corename.lower() in [s.lower() for s in KNOWN_NON_ARCADE_SYSTEMS])
@@ -269,6 +291,114 @@ def _read_file(path):
             return f.read().strip()
     except:
         return ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROM-load contention guard
+#
+# Hashing a ROM reads it off the same SD/USB the core is loading from, so doing
+# it while the core's "Loading" progress bar is still filling steals bandwidth
+# and stutters the load. The core load is the MiSTer binary reading the file in a
+# chunked read() loop (the progress bar tracks that loop), so we know the load
+# has finished when that process stops reading.
+#
+# We watch /proc/<pid>/io 'rchar' (bytes read at the syscall level). Unlike
+# 'read_bytes' (block layer only), 'rchar' also covers network-backed storage
+# (CIFS/NAS), so this works regardless of where the user keeps their ROMs.
+#
+# Best-effort and fails OPEN: if the process or counter can't be read, it returns
+# at once and hashing proceeds exactly as before. It never blocks detection,
+# never holds a lock, and never raises.
+# ─────────────────────────────────────────────────────────────────────────────
+_LOAD_POLL_INTERVAL  = 0.25         # seconds between rchar samples
+_LOAD_ACTIVITY_BYTES = 512 * 1024   # per-poll growth above this = "still loading"
+_LOAD_QUIET_WINDOW   = 1.5          # seconds with no activity = load finished
+_LOAD_INITIAL_GRACE  = 0.8          # if no activity seen by now, assume idle
+_LOAD_MAX_WAIT       = 25.0         # hard cap (streaming cores never go quiet)
+
+
+def _find_mister_pid():
+    """Return the PID of the running MiSTer binary, or None. Fails soft."""
+    try:
+        out = subprocess.check_output(['pidof', 'MiSTer'],
+                                      stderr=subprocess.DEVNULL, timeout=2)
+        parts = out.decode(errors='ignore').strip().split()
+        if parts:
+            return int(parts[0])
+    except Exception:
+        pass
+    # Fallback for environments without a working pidof: scan /proc/*/comm
+    try:
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f'/proc/{entry}/comm', 'r') as f:
+                    if f.read().strip() == 'MiSTer':
+                        return int(entry)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _read_mister_rchar(pid):
+    """Return cumulative 'rchar' bytes from /proc/<pid>/io, or None."""
+    try:
+        with open(f'/proc/{pid}/io', 'r') as f:
+            for line in f:
+                if line.startswith('rchar:'):
+                    return int(line.split(':', 1)[1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def _wait_for_rom_load_to_settle():
+    """
+    Block until the MiSTer core has finished copying the ROM to SDRAM, so hashing
+    doesn't compete with the load. Returns promptly when the system is idle, when
+    the signal is unavailable, or after _LOAD_MAX_WAIT.
+    """
+    pid = _find_mister_pid()
+    if pid is None:
+        return  # can't observe -> proceed (same behaviour as before)
+
+    prev = _read_mister_rchar(pid)
+    if prev is None:
+        return
+
+    start         = time.monotonic()
+    last_activity = start
+    saw_activity  = False
+
+    while True:
+        time.sleep(_LOAD_POLL_INTERVAL)
+        now = time.monotonic()
+
+        cur = _read_mister_rchar(pid)
+        if cur is None:
+            return  # process gone / unreadable -> proceed
+
+        if (cur - prev) > _LOAD_ACTIVITY_BYTES:
+            saw_activity  = True
+            last_activity = now
+        prev = cur
+
+        # Was loading, now quiet for the full window -> load finished.
+        if saw_activity and (now - last_activity) >= _LOAD_QUIET_WINDOW:
+            print(f"⏳ ROM load settled after {now - start:.1f}s — hashing now")
+            return
+
+        # Nothing was loading when we arrived -> don't wait the full window.
+        if not saw_activity and (now - start) >= _LOAD_INITIAL_GRACE:
+            return
+
+        # Safety cap (e.g. streaming cores that never go quiet).
+        if (now - start) >= _LOAD_MAX_WAIT:
+            print(f"⏳ ROM load wait hit {_LOAD_MAX_WAIT:.0f}s cap — hashing anyway")
+            return
 
 
 def _get_mtime_ns(path):
@@ -519,11 +649,12 @@ def _watcher_thread():
     """
     print("👁️ Watcher thread started")
     while True:
+        _ensure_watched_files()
         try:
             proc = subprocess.Popen(
                 ['inotifywait', '-m', '-e', 'close_write,create'] + _WATCHED_FILES,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True
             )
             for line in proc.stdout:
@@ -547,11 +678,46 @@ def _watcher_thread():
                 
                 _update_state()
             proc.wait()
+            err = (proc.stderr.read() or '').strip()  # ← NUEVO
+            if err or proc.returncode not in (0, None):
+                print(f"⚠️ inotifywait exited (code={proc.returncode}): {err or 'no stderr'}")
         except Exception as e:
             print(f"⚠️ Watcher thread error: {e}")
         print("🔄 Watcher thread restarting...")
         time.sleep(1)
 
+# --- MiSTer Monitor UDP discovery responder -------------------------------
+DISCOVERY_PORT    = 51234
+DISCOVERY_REQUEST = b"MMON_DISCOVER_V1"
+DISCOVERY_REPLY   = b"MMON_SERVER_V1:8081"   # advertise the HTTP port too
+
+def _start_discovery_responder():
+    """
+    Lets the display find this server with no hardcoded IP.
+    The display broadcasts DISCOVERY_REQUEST; we reply (unicast) with
+    DISCOVERY_REPLY directly to the sender, which reads our address
+    from the reply's source IP.
+    """
+    def _run():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('', DISCOVERY_PORT))
+        except OSError as e:
+            print(f"Discovery responder: cannot bind UDP {DISCOVERY_PORT}: {e}")
+            return
+        print(f"Discovery responder listening on UDP {DISCOVERY_PORT}")
+        while True:
+            try:
+                data, addr = sock.recvfrom(64)
+                if data.strip() == DISCOVERY_REQUEST:
+                    sock.sendto(DISCOVERY_REPLY, addr)
+                    print(f"Discovery: replied to {addr[0]}")
+            except Exception as e:
+                print(f"Discovery responder error: {e}")
+                time.sleep(1)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 def _start_watcher():
     """Starts the background watcher thread as a daemon."""
@@ -591,8 +757,10 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
         
-        # Endpoints principales
-        if path == '/status/core':
+        # Main endpoints
+        if path == '/' or path == '/status':
+            self.send_index_page()
+        elif path == '/status/core':
             self.send_text_response(self.get_current_core())
         elif path == '/status/game':
             self.send_text_response(self.get_current_game())
@@ -883,55 +1051,17 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
     
     def get_current_rom(self):
         """
-        Gets the current ROM using multiple methods
+        Returns the current ROM filename from centralized state.
+
         """
-        # Method 1: Read ACTIVEGAME (priority)
-        try:
-            with open('/tmp/ACTIVEGAME', 'r') as f:
-                content = f.read().strip()
-                if content:
-                    return os.path.basename(content)
-        except:
-            pass
-        
-        # Method 2: Read SAM_Game.txt
-        try:
-            with open('/tmp/SAM_Game.txt', 'r') as f:
-                content = f.read().strip()
-                if content:
-                    return os.path.basename(content)
-        except:
-            pass
-        
-        # Method 3: Parse SAM_Game.mgl
-        try:
-            with open('/tmp/SAM_Game.mgl', 'r') as f:
-                content = f.read()
-                match = re.search(r'<file[^>]*>([^<]+)</file>', content)
-                if match:
-                    file_path = match.group(1)
-                    return os.path.basename(file_path)
-        except:
-            pass
-        
-        # Method 4: Search for LASTGAME/LASTROM files
-        try:
-            game_patterns = ['/tmp/LASTGAME*', '/tmp/LASTROM*', '/tmp/*ROM*']
-            for pattern in game_patterns:
-                games = glob.glob(pattern)
-                if games:
-                    latest_file = max(games, key=os.path.getctime)
-                    try:
-                        with open(latest_file, 'r') as f:
-                            content = f.read().strip()
-                            if content:
-                                return os.path.basename(content)
-                    except:
-                        continue
-        except:
-            pass
-        
-        return "Sin ROM"
+        with _state_lock:
+            game_path = _state['game_path']
+            game_name = _state['game']
+        if game_path:
+            return os.path.basename(game_path)
+        if game_name:
+            return game_name
+        return "No ROM"
 
     def get_system_info(self):
         """
@@ -1209,7 +1339,9 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
     
     def get_zip_file_info_enhanced(self, zip_path, internal_path):
         """
-        ENHANCED: Get file info from ZIP with multiple search strategies
+        ENHANCED: Get file info from ZIP with multiple search strategies.
+        Returns (filename, file_size, crc32_int) where crc32_int comes straight
+        from the ZIP central directory (ZipInfo.CRC) — no decompression needed.
         """
         try:
             with zipfile.ZipFile(zip_path, 'r') as zip_file:
@@ -1229,7 +1361,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                         info = zip_file.getinfo(search_path)
                         filename = os.path.basename(search_path)
                         print(f"✅ File info found: {filename} ({info.file_size:,} bytes)")
-                        return filename, info.file_size
+                        return filename, info.file_size, info.CRC
                 
                 # Case-insensitive search
                 internal_lower = internal_path.lower()
@@ -1238,7 +1370,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                         info = zip_file.getinfo(zip_file_path)
                         filename = os.path.basename(zip_file_path)
                         print(f"✅ File info (case-insensitive): {filename} ({info.file_size:,} bytes)")
-                        return filename, info.file_size
+                        return filename, info.file_size, info.CRC
                 
                 # Filename-only search
                 target_filename = os.path.basename(internal_path).lower()
@@ -1247,7 +1379,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                         info = zip_file.getinfo(zip_file_path)
                         filename = os.path.basename(zip_file_path)
                         print(f"✅ File info (filename): {filename} ({info.file_size:,} bytes)")
-                        return filename, info.file_size
+                        return filename, info.file_size, info.CRC
                 
                 # Strategy 5: Stem match — handles cores that write the filename
                 # without extension to CURRENTPATH. Compare the path stem (without
@@ -1271,14 +1403,14 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                     print(f"✅ File info (stem match): {filename} ({info.file_size:,} bytes)")
                     if len(stem_matches) > 1:
                         print(f"   ℹ️ {len(stem_matches)} candidates with same stem; chose ROM-ext match")
-                    return filename, info.file_size
+                    return filename, info.file_size, info.CRC
                 
                 print(f"❌ File info not found: {internal_path}")
-                return None, 0
+                return None, 0, 0
             
         except Exception as e:
             print(f"❌ ZIP info error: {e}")
-            return None, 0
+            return None, 0, 0
     
     def get_rom_details(self):
         """
@@ -1295,31 +1427,41 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             print("📋 Using cached ROM details")
             return cached
 
-        print("📄 Computing ROM details...")
+        # Coalesce concurrent requests: a second caller (e.g. the firmware's
+        # retry) blocks on this lock, then re-checks the cache and returns the
+        # first thread's result instead of starting a duplicate hash/CRC.
+        with _rom_details_compute_lock:
+            with _state_lock:
+                stale   = _state['rom_details_stale']
+                cached  = _state['rom_details']
+            if not stale and cached is not None:
+                print("📋 Using cached ROM details (computed by concurrent request)")
+                return cached
 
-        rom_path = self._get_enhanced_rom_path()
+            print("📄 Computing ROM details...")
+            rom_path = self._get_enhanced_rom_path()
 
-        if not rom_path:
-            result = {
-                "filename": "", "size": 0, "crc32": "", "md5": "", "sha1": "",
-                "path": "", "available": False,
-                "error": "No active ROM found",
-                "detection_method": "none",
-                "timestamp": int(time.time())
-            }
-        else:
-            is_zip, zip_path, internal_path = self.is_zip_path(rom_path)
-            if is_zip:
-                result = self.get_rom_details_from_zip(rom_path, zip_path, internal_path)
+            if not rom_path:
+                result = {
+                    "filename": "", "size": 0, "crc32": "", "md5": "", "sha1": "",
+                    "path": "", "available": False,
+                    "error": "No active ROM found",
+                    "detection_method": "none",
+                    "timestamp": int(time.time())
+                }
             else:
-                result = self.get_rom_details_from_file(rom_path)
-            result["detection_method"] = getattr(self, '_last_detection_method', 'unknown')
+                is_zip, zip_path, internal_path = self.is_zip_path(rom_path)
+                if is_zip:
+                    result = self.get_rom_details_from_zip(rom_path, zip_path, internal_path)
+                else:
+                    result = self.get_rom_details_from_file(rom_path)
+                result["detection_method"] = getattr(self, '_last_detection_method', 'unknown')
 
-        with _state_lock:
-            _state['rom_details']       = result
-            _state['rom_details_stale'] = False
+            with _state_lock:
+                _state['rom_details']       = result
+                _state['rom_details_stale'] = False
 
-        return result
+            return result
     
     def get_rom_details_forced(self):
         """
@@ -1779,6 +1921,8 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             
             if file_size <= MAX_SIZE_FOR_HASH:
                 try:
+                    _wait_for_rom_load_to_settle()   # don't hash mid-load
+
                     start_time = time.time()
                     print(f"Calculating hashes for {filename}...")
                     
@@ -1898,7 +2042,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             print(f"📂 Opening ZIP: {resolved_zip_path}")
             
             # Get file info from ZIP with enhanced search
-            filename, file_size = self.get_zip_file_info_enhanced(resolved_zip_path, internal_path)
+            filename, file_size, zip_crc = self.get_zip_file_info_enhanced(resolved_zip_path, internal_path)
             
             if not filename:
                 error_msg = f"File not found inside ZIP: {internal_path}"
@@ -1932,66 +2076,18 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 }
             
             print(f"📁 File found in ZIP: {filename} ({file_size:,} bytes)")
-            
-            # Calculate hashes
-            crc32 = ""
+
+            # CRC32 comes straight from the ZIP central directory (ZipInfo.CRC) —
+            # no decompression. ScreenScraper matches on CRC, so this is all the
+            # firmware needs, and it returns in milliseconds instead of minutes.
+            # MD5/SHA1 are not stored in the directory; we leave them empty (a CRC
+            # match is enough). With no payload read there is also no SD/CPU
+            # contention with the core load, so the load watcher isn't needed here.
+            crc32 = format(zip_crc & 0xffffffff, '08X')
             md5 = ""
             sha1 = ""
-            
-            MAX_SIZE_FOR_HASH = 100 * 1024 * 1024  # 100MB
-            
-            if file_size <= MAX_SIZE_FOR_HASH:
-                try:
-                    start_time = time.time()
-                    print(f"🔢 Calculating hashes for {filename}...")
-                    
-                    # Get file content from ZIP
-                    file_content = self.get_file_from_zip_enhanced(resolved_zip_path, internal_path)
-                    
-                    if file_content is None:
-                        raise Exception("Could not read file from ZIP")
-                    
-                    # Calculate hashes
-                    import zlib
-                    import hashlib
-                    
-                    crc32_calc = zlib.crc32(file_content)
-                    md5_calc = hashlib.md5(file_content)
-                    sha1_calc = hashlib.sha1(file_content)
-                    
-                    crc32 = format(crc32_calc & 0xffffffff, '08X')
-                    md5 = md5_calc.hexdigest().upper()
-                    sha1 = sha1_calc.hexdigest().upper()
-                    
-                    calc_time = time.time() - start_time
-                    print(f"✅ Hashes calculated in {calc_time:.2f}s")
-                    print(f"   CRC32: {crc32}")
-                    print(f"   MD5: {md5}")
-                    print(f"   SHA1: {sha1}")
-                    
-                except Exception as e:
-                    error_msg = f"Hash calculation failed: {str(e)}"
-                    print(f"❌ {error_msg}")
-                    
-                    # Return partial success
-                    return {
-                        "filename": filename,
-                        "size": file_size,
-                        "crc32": "",
-                        "md5": "",
-                        "sha1": "",
-                        "path": full_path,
-                        "available": True,
-                        "hash_calculated": False,
-                        "error": error_msg,
-                        "zip_path": zip_path,
-                        "resolved_zip_path": resolved_zip_path,
-                        "internal_path": internal_path,
-                        "timestamp": int(time.time())
-                    }
-            else:
-                print(f"⚠️ File too large for hash calculation: {file_size:,} bytes")
-            
+            print(f"🔢 CRC32 from ZIP directory: {crc32} (no decompression)")
+
             # Return successful result
             result = {
                 "filename": filename,
@@ -2002,13 +2098,13 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 "path": full_path,
                 "available": True,
                 "hash_calculated": len(crc32) > 0,
-                "file_too_large": file_size > MAX_SIZE_FOR_HASH,
+                "file_too_large": False,
                 "zip_path": zip_path,
                 "resolved_zip_path": resolved_zip_path,
                 "internal_path": internal_path,
                 "timestamp": int(time.time())
             }
-            
+
             print(f"✅ ZIP ROM extraction successful!")
             print(f"📊 Result: {filename}, CRC32={crc32}, Size={file_size:,}")
             return result
@@ -2040,6 +2136,42 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(str(data).encode('utf-8'))
+
+    def send_index_page(self):
+        """Friendly landing page for humans hitting the server root.
+
+        The display never calls '/'; this exists only so that a manual
+        connectivity test (typing the server URL into a browser) returns
+        something reassuring instead of a 404 that looks like a failure.
+        """
+        endpoints = [
+            ('/status/core', 'Active core'),
+            ('/status/game', 'Active game'),
+            ('/status/rom', 'Loaded ROM'),
+            ('/status/rom/details', 'ROM details (CRC, hash, path)'),
+            ('/status/system', 'CPU, memory, uptime'),
+            ('/status/storage', 'SD / USB storage'),
+            ('/status/network', 'Network status'),
+            ('/status/usb', 'USB devices'),
+            ('/status/session', 'Session statistics'),
+            ('/status/all', 'All data combined'),
+        ]
+        rows = ''.join(
+            f'<li><a href="{p}">{p}</a> — {d}</li>' for p, d in endpoints
+        )
+        html = (
+            '<!DOCTYPE html><html><head><meta charset="utf-8">'
+            '<title>MiSTer Monitor</title></head><body>'
+            '<h1>MiSTer Monitor server</h1>'
+            '<p>The server is running. Available endpoints:</p>'
+            f'<ul>{rows}</ul>'
+            '</body></html>'
+        )
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(html.encode('utf-8'))
     
     def send_json_response(self, data):
         self.send_response(200)
@@ -2058,6 +2190,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     try:
         _start_watcher()
+        _start_discovery_responder()
         server = ThreadingHTTPServer(('', 8081), MiSTerStatusHandler)
         print("MiSTer Monitor Status Server v2 - port 8081")
         print("Endpoints:")
