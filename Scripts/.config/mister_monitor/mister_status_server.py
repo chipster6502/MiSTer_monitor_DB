@@ -181,6 +181,13 @@ CORE_NAME_MAPPING = {
     'NEOGEO': 'Neo-Geo',
     'NeoGeo-CD': 'Neo-Geo CD',
     'NeoGeoPocket': 'Neo-Geo Pocket',
+    'cdi':          'Phillips CD-i',
+    'colecovision': 'Colecovision',
+    'jaguar':       'Atari Jaguar',
+    'neogeocd':     'Neo-Geo CD',
+    'tgfx16cd':     'TurboGrafx-16/PC Engine CD-Rom',
+    'x68k':         'Sharp X68000',
+    'Neo Geo MVS/AES': 'Neo-Geo',
     'Casio_PV-1000': 'Casio PV-1000',
     'VC4000': 'Interton VC 4000',
     'PocketChallenge': 'Pocket Challenge V2',
@@ -443,6 +450,7 @@ def _sam_get_current():
             sam_core      = (CORE_NAME_MAPPING.get(sam_core_raw) or
                              CORE_NAME_MAPPING_LOWER.get(sam_core_raw.lower()) or
                              sam_core_raw)
+            sam_core      = CORE_NAME_MAPPING.get(sam_core, sam_core)
             print(f"✅ SAM detected — core='{sam_core}' game='{sam_game}'")
             return True, sam_core_raw, sam_core, sam_game, sam_path
 
@@ -555,6 +563,7 @@ def _update_state():
     friendly_name = (CORE_NAME_MAPPING.get(corename) or
                     CORE_NAME_MAPPING_LOWER.get(corename.lower()) or
                     corename)
+    friendly_name = CORE_NAME_MAPPING.get(friendly_name, friendly_name)
 
     # --- Arcade detection ---
     ARCADE_FRESHNESS = 30  # seconds
@@ -904,69 +913,6 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
 
     # ========== HELPER FUNCTIONS ==========
 
-    def detect_arcade_name_similarity(self, corename, activegame_path):
-        """
-        Detecta similitudes entre CORENAME y nombre de archivo arcade
-        Para resolver conflictos MiSTer nativo vs interfaz web
-        
-        Returns: (is_similar, confidence_score)
-        """
-        if not corename or not activegame_path:
-            return False, 0.0
-        
-        # Extraer nombre del archivo .mra
-        arcade_filename = os.path.splitext(os.path.basename(activegame_path))[0]
-        
-        # Clean names for comparison
-        corename_clean = re.sub(r'[^a-z0-9]', '', corename.lower())
-        arcade_clean = re.sub(r'[^a-z0-9]', '', arcade_filename.lower())
-        
-        print(f"🔍 Comparing: '{corename}' (clean: '{corename_clean}') vs '{arcade_filename}' (clean: '{arcade_clean}')")
-        
-        # Criterio 1: Coincidencia exacta
-        if corename_clean == arcade_clean:
-            print(f"✅ Exact match found")
-            return True, 1.0
-        
-        # Criterio 2: CORENAME es prefijo significativo
-        if len(corename_clean) >= 4 and arcade_clean.startswith(corename_clean):
-            confidence = len(corename_clean) / len(arcade_clean)
-            print(f"✅ Prefix match found (confidence: {confidence:.2f})")
-            return True, confidence
-        
-        # Criterio 3: Subcadenas comunes
-        if len(corename_clean) >= 6:
-            common_chars = 0
-            for char in corename_clean:
-                if char in arcade_clean:
-                    common_chars += 1
-            
-            coverage = common_chars / len(corename_clean)
-            if coverage >= 0.7:  # 70% de caracteres comunes
-                print(f"✅ Character similarity found (coverage: {coverage:.2f})")
-                return True, coverage
-        
-        # Criterion 4: Remove common suffixes
-        # Simplified version without complex regex
-        suffixes_to_remove = ['m72', 'cps1', 'cps2', 'neogeo', 'world', 'usa', 'japan']
-        
-        corename_base = corename_clean
-        arcade_base = arcade_clean
-        
-        for suffix in suffixes_to_remove:
-            if corename_base.endswith(suffix):
-                corename_base = corename_base[:-len(suffix)]
-            if arcade_base.endswith(suffix):
-                arcade_base = arcade_base[:-len(suffix)]
-        
-        if len(corename_base) >= 4 and len(arcade_base) >= 4:
-            if corename_base == arcade_base or arcade_base.startswith(corename_base):
-                print(f"✅ Base name match found: '{corename_base}' vs '{arcade_base}'")
-                return True, 0.8
-        
-        print(f"❌ No significant similarity found")
-        return False, 0.0
-
     def extract_game_name(self, game_path, preserve_parentheses=True):
         """
         Extrae el nombre del juego de una ruta
@@ -1256,86 +1202,6 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             return True, zip_path, internal_path
         
         return False, None, None
-    
-    def get_file_from_zip_enhanced(self, zip_path, internal_path):
-        """
-        ENHANCED: Extract file content from ZIP with multiple search strategies
-        """
-        try:
-            print(f"📂 Reading from ZIP: {internal_path}")
-            
-            with zipfile.ZipFile(zip_path, 'r') as zip_file:
-                zip_files = zip_file.namelist()
-                
-                # Strategy 1: Exact match
-                if internal_path in zip_files:
-                    print(f"✅ Exact match: {internal_path}")
-                    with zip_file.open(internal_path) as file_in_zip:
-                        return file_in_zip.read()
-                
-                # Strategy 2: Path separator variants
-                variants = [
-                    internal_path.replace('\\', '/'),
-                    internal_path.replace('/', '\\'),
-                    internal_path.replace('\\', '/').lstrip('/'),
-                    internal_path.replace('/', '\\').lstrip('\\')
-                ]
-                
-                for variant in variants:
-                    if variant in zip_files:
-                        print(f"✅ Variant match: {variant}")
-                        with zip_file.open(variant) as file_in_zip:
-                            return file_in_zip.read()
-                
-                # Strategy 3: Case-insensitive search
-                internal_lower = internal_path.lower()
-                for zip_file_path in zip_files:
-                    if zip_file_path.lower() == internal_lower:
-                        print(f"✅ Case-insensitive match: {zip_file_path}")
-                        with zip_file.open(zip_file_path) as file_in_zip:
-                            return file_in_zip.read()
-                
-                # Strategy 4: Filename-only search
-                filename = os.path.basename(internal_path)
-                filename_lower = filename.lower()
-                
-                for zip_file_path in zip_files:
-                    if os.path.basename(zip_file_path).lower() == filename_lower:
-                        print(f"✅ Filename match: {zip_file_path}")
-                        with zip_file.open(zip_file_path) as file_in_zip:
-                            return file_in_zip.read()
-                
-                # Strategy 5: Stem match — must mirror get_zip_file_info_enhanced,
-                # otherwise the size lookup succeeds but the content read fails.
-                target_stem = os.path.splitext(internal_path)[0].lower()
-                stem_matches = []
-                for zip_file_path in zip_files:
-                    zip_stem = os.path.splitext(zip_file_path)[0].lower()
-                    if zip_stem == target_stem:
-                        stem_matches.append(zip_file_path)
-                
-                if stem_matches:
-                    rom_match = next(
-                        (m for m in stem_matches
-                         if os.path.splitext(m)[1].lower() in _KNOWN_ROM_EXTS),
-                        None
-                    )
-                    chosen = rom_match if rom_match else stem_matches[0]
-                    print(f"✅ Stem match: {chosen}")
-                    with zip_file.open(chosen) as file_in_zip:
-                        return file_in_zip.read()
-                
-                # Show debug info
-                print(f"❌ File not found. Searched for: {internal_path}")
-                print(f"📋 Available files (first 10):")
-                for i, zf in enumerate(zip_files[:10]):
-                    print(f"   {i+1}. {zf}")
-                
-                return None
-                
-        except Exception as e:
-            print(f"❌ ZIP read error: {e}")
-            return None
     
     def get_zip_file_info_enhanced(self, zip_path, internal_path):
         """
@@ -1809,6 +1675,14 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                     else:
                         print(f"❌ Direct file not found: {final_path}")
 
+                        # CD images: some cores (PSX, Saturn) write CURRENTPATH without the
+                        # extension. Try common disc-image extensions before giving up.
+                        for ext in ('.chd', '.cue', '.iso', '.pbp'):
+                            cd_candidate = final_path + ext
+                            if os.path.exists(cd_candidate):
+                                print(f"✅ CD image found ({source_name}): {cd_candidate}")
+                                return cd_candidate
+
                         # Last resort: same-name ZIP in the same directory
                         # (handles individual per-game ZIPs: game.dsk → game.zip/game.dsk)
                         parent_dir = os.path.dirname(final_path)
@@ -1844,6 +1718,14 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         if os.path.isabs(path):
             resolved = os.path.normpath(path)
             print(f"✅ Already absolute: {resolved}")
+            return resolved
+        
+        # USB/external drives mount at /media/usbN, NOT under /media/fat.
+        # Resolve any leading ../ sequence pointing at usb0..usb7 correctly.
+        m = re.match(r'(?:\.\./)+(usb[0-7]/.*)$', path)
+        if m:
+            resolved = os.path.normpath('/media/' + m.group(1))
+            print(f"🔧 USB path resolved: {resolved}")
             return resolved
         
         # Case 2: Starts with ../../../media/fat/ - remove the ../ and normalize
@@ -1911,13 +1793,16 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             
             print(f"Processing ROM: {filename} ({file_size:,} bytes)")
             
-            # Calculate hashes (only for files < 100MB for performance)
+            # Calculate hashes (skip only for pathologically large files)
             crc32 = ""
             md5 = ""
             sha1 = ""
             
-            # Size limit to avoid blocking server with very large files
-            MAX_SIZE_FOR_HASH = 100 * 1024 * 1024  # 100MB
+            # Size limit to avoid blocking the server with very large files.
+            # 1GB safely covers any single CD image (CDs cap at ~700MB, and a CHD
+            # is compressed) while still guarding against a corrupt or mis-resolved
+            # path pointing at something huge.
+            MAX_SIZE_FOR_HASH = 1024 * 1024 * 1024  # 1GB
             
             if file_size <= MAX_SIZE_FOR_HASH:
                 try:
@@ -1928,7 +1813,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                     
                     with open(rom_path, 'rb') as f:
                         # Read file in chunks to avoid saturating memory
-                        chunk_size = 64 * 1024  # 64KB chunks
+                        chunk_size = 1024 * 1024  # 1MB chunks
                         crc32_calc = 0
                         md5_calc = hashlib.md5()
                         sha1_calc = hashlib.sha1()
@@ -1945,6 +1830,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                             sha1_calc.update(chunk)
                             
                             bytes_processed += len(chunk)
+                            time.sleep(0.003)   # ~0.3s extra per 100MB hashed
                     
                     # Format results
                     crc32 = format(crc32_calc & 0xffffffff, '08X')
