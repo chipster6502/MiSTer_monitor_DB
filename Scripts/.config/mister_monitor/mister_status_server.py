@@ -18,6 +18,7 @@ import zipfile
 import io
 import socket
 from urllib.parse import urlparse
+import queue
 
 def _load_names_txt():
     """
@@ -131,6 +132,8 @@ CORE_NAME_MAPPING = {
     'C128': 'Commodore 128',
     'VIC20': 'Commodore Vic-20',
     'Minimig': 'Commodore Amiga',
+    'CD32': 'Amiga CD32',
+    'AmigaCD32': 'Amiga CD32',
     'AO486': 'PC Dos',
     'PCXT': 'PC Dos',
     'PCjr': 'PC Dos',
@@ -176,12 +179,12 @@ CORE_NAME_MAPPING = {
     'Gamate': 'Bit Corporation Gamate',
     'AVision': 'Adventure Vision',
     'Arcadia': 'Arcadia 2001',
-    'CD-i': 'Phillips CD-i',
+    'CD-i': 'Philips CD-i',
     'MegaDuck': 'Mega Duck',
     'NEOGEO': 'Neo-Geo',
     'NeoGeo-CD': 'Neo-Geo CD',
     'NeoGeoPocket': 'Neo-Geo Pocket',
-    'cdi':          'Phillips CD-i',
+    'cdi':          'Philips CD-i',
     'colecovision': 'Colecovision',
     'jaguar':       'Atari Jaguar',
     'neogeocd':     'Neo-Geo CD',
@@ -251,12 +254,50 @@ _state = {
     'is_arcade':         False,    # True if current core is arcade
     'rom_details':       None,     # last ScreenScraper result (dict or None)
     'rom_details_stale': True,     # True = needs refresh on next request
+    'seq':               0,        # monotonic generation counter — bumps on every REAL identity change
+    'updated_at':        0.0,      # epoch of last committed change
+    'last_event':        'boot',   # 'boot' | 'load' | 'core' | 'menu' | 'sam'
 }
+
+# Raw CORENAME as seen at the last evaluation — a core change must always
+# bypass the navigation gate (stale coupled nav timestamps would otherwise
+# mask a core-only load).
+_last_evaluated_corename = None
 
 # Error tracking — exposed via /status/error_state and /status/all
 server_error_state        = ''    # last error message, empty string if none
 last_valid_core           = ''    # last corename that produced a valid state
 last_valid_core_timestamp = 0.0   # epoch time of last valid state update
+
+def _commit_state(core, game, game_path, is_arcade, event):
+    """
+    Atomically commits a derived state. Bumps 'seq' and invalidates the
+    rom-details cache ONLY when the identity actually changed, so a spurious
+    re-evaluation can no longer wipe a hash computed for the same game.
+    Returns True if the state changed.
+    """
+    with _state_lock:
+        changed = (_state['core']      != core or
+                   _state['game']      != game or
+                   _state['game_path'] != game_path or
+                   _state['is_arcade'] != is_arcade)
+        if changed:
+            _state['core']              = core
+            _state['system_name']       = core
+            _state['game']              = game
+            _state['game_path']         = game_path
+            _state['is_arcade']         = is_arcade
+            _state['rom_details']       = None
+            _state['rom_details_stale'] = True
+            _state['seq']              += 1
+            _state['updated_at']        = time.time()
+            _state['last_event']        = event
+        seq_now = _state['seq']
+    if changed:
+        print(f"✅ State committed (seq={seq_now}, {event}): core='{core}' game='{game}' arcade={is_arcade}")
+    else:
+        print(f"♻️ Evaluation confirmed current state (seq={seq_now}) — rom cache preserved")
+    return changed
 
 # ---------------------------------------------------------------------------
 # Background watcher thread — monitors /tmp/ files via inotifywait
@@ -482,22 +523,94 @@ def _sam_is_current():
 
 _KNOWN_ROM_EXTS = {
     '.zip', '.mra', '.mgl', '.rom', '.bin', '.iso', '.chd',
-    '.nes', '.sfc', '.smd', '.md', '.gba', '.gb', '.gbc',
-    '.a78', '.a52', '.a26', '.n64', '.z64', '.pce', '.cue',
-    '.lnx', '.ngp', '.ngc', '.ws', '.wsc', '.sg', '.sms',
-    '.gg', '.col', '.vec', '.int', '.psx', '.img',
-    # 8-bit computers
-    '.prg', '.d64', '.t64', '.tap', '.crt', '.g64',  # Commodore
-    '.atr', '.xex', '.cas', '.car',                   # Atari 8bit
-    '.dsk', '.st', '.msa', '.stx', '.dim',            # Atari ST
-    '.tzx', '.tap', '.z80', '.sna', '.trd', '.scl',  # Spectrum
-    '.cdt', '.cpc', '.voc',                           # Amstrad CPC
-    '.vhd', '.hdf', '.adf', '.adz',                   # Amiga
-    '.do', '.po', '.2mg',                             # Apple II
-    '.mx1', '.mx2',                                   # MSX
-    '.col', '.cv',                                     # ColecoVision
-    '.m3u',                                            # playlists
+    # Nintendo
+    '.nes', '.fds', '.nsf', '.sfc', '.smc', '.bs', '.spc',
+    '.gba', '.gb', '.gbc', '.n64', '.z64', '.min',
+    # Sega
+    '.smd', '.md', '.gen', '.32x', '.sg', '.sms', '.gg',
+    # Sony
+    '.psx', '.exe',
+    # NEC / Hudson
+    '.pce', '.sgx',
+    # SNK
+    '.neo', '.ngp', '.ngc',
+    # Atari
+    '.a78', '.a52', '.a26', '.lnx', '.jag', '.j64',
+    '.atr', '.xex', '.cas', '.car', '.atx', '.xfd',
+    '.st', '.msa', '.stx', '.dim',
+    # Other consoles / handhelds
+    '.ws', '.wsc', '.pc2', '.col', '.cv', '.vec', '.ovr', '.int',
+    '.sv', '.ch8', '.hex', '.gmc',
+    # Commodore
+    '.prg', '.d64', '.d81', '.t64', '.tap', '.crt', '.g64', '.reu',
+    # Spectrum / SAM / Next
+    '.tzx', '.z80', '.sna', '.trd', '.scl', '.csw', '.mgt',
+    # Amstrad CPC
+    '.cdt', '.cpc', '.voc',
+    # Amiga / PC
+    '.vhd', '.hdf', '.adf', '.adz', '.img', '.ima', '.vfd',
+    # Apple
+    '.do', '.po', '.2mg', '.nib', '.hdv',
+    # MSX
+    '.mx1', '.mx2', '.dsk', '.cue',
+    # Japanese computers
+    '.d88', '.ram',
+    # British / misc micros
+    '.ssd', '.dsd', '.ace', '.mdv', '.win', '.bas', '.lod',
+    '.vz', '.caq', '.c10', '.ccc', '.cmd', '.jvi', '.m99',
+    # Eastern-bloc / other computers
+    '.c00', '.com', '.edd', '.fdd', '.rka', '.rkr', '.rks',
+    '.rmm', '.odi', '.gam', '.cin', '.k7', '.p',
+    # PDP-1
+    '.pdp', '.rim',
 }
+
+# Containers whose CRC is never indexed by ScreenScraper (0MHz DOS packs
+# build per-pack VHDs, so their CRCs exist in no database — and the guest OS
+# rewrites them, so the CRC is unstable anyway). Extensible.
+_NO_HASH_EXTS = {'.vhd'}
+
+def _clean_search_name(name):
+    """
+    Derives a ScreenScraper text-search query from a game/file name:
+    strips extension, bracketed tags and ALL parenthesised groups, then
+    collapses separators.
+      'Prince of Persia (1990)(Broderbund).vhd' -> 'Prince of Persia'
+      'Doom_[0MHz].mgl'                         -> 'Doom'
+    Recall beats precision here: jeuRecherche matches best on bare titles.
+    Validated against the real 0mhz-dos item listing on archive.org.
+    """
+    base = os.path.splitext(os.path.basename(name or ''))[0]
+    base = re.sub(r'\[[^\]]*\]', '', base)     # [tags]
+    base = re.sub(r'\([^)]*\)', '', base)      # (Year)(Publisher)(Region)
+    base = base.lstrip('~ ')                   # 0MHz marks broken setups with a leading '~'
+    base = base.replace('_', ' ')
+    base = re.sub(r'\s{2,}', ' ', base).strip(' -.')
+    return base
+
+def _enrich_rom_result(result):
+    """
+    Adds name-search metadata to a rom-details result (success OR failure):
+      search_name      — clean title for jeuRecherche.php
+      name_search_hint — True when the CRC route cannot work: no ROM was
+                         resolvable, no CRC was computed, or the container
+                         extension is known to be unindexed (.vhd).
+    The firmware combines this hint with its own per-system allowlist, so a
+    TRANSIENT hash failure (USB race) on a CRC-capable system never silently
+    degrades into a fuzzy name search with wrong-region artwork risk.
+    """
+    with _state_lock:
+        game_for_name = _state['game']
+        path_for_name = _state['game_path']
+
+    ext = os.path.splitext(result.get('path') or path_for_name or '')[1].lower()
+    result['search_name']      = _clean_search_name(result.get('filename') or game_for_name)
+    result['name_search_hint'] = bool(
+        (not result.get('available')) or
+        (not result.get('crc32')) or
+        (ext in _NO_HASH_EXTS)
+    )
+    return result
 
 def _game_name_from_path(path):
     """
@@ -519,44 +632,43 @@ def _update_state():
     currentpath = _read_file('/tmp/CURRENTPATH')
     fullpath    = _read_file('/tmp/FULLPATH')
 
-    # --- Navigation vs real load ---
-    # MiSTer writes FILESELECT and CURRENTPATH at the exact same nanosecond
-    # during OSD navigation. After a real load, only FILESELECT is updated.
-    fs_ns  = _get_mtime_ns('/tmp/FILESELECT')
-    cp_ns  = _get_mtime_ns('/tmp/CURRENTPATH')
-    is_navigation = (fs_ns == cp_ns)
+    # --- Navigation vs real load (tolerant gate) ---
+    # Empirical MiSTer behaviour: during OSD navigation FILESELECT and
+    # CURRENTPATH are written back-to-back (sub-millisecond apart); on a real
+    # load only FILESELECT is touched.
+    # A tolerance window separates the two cases robustly: coupled writes are
+    # microseconds apart, a human cursor-move followed by Enter is >= ~100 ms.
+    global _last_evaluated_corename
 
-    if is_navigation:
-        # User is browsing OSD — keep current state unchanged
-        print("🔀 OSD navigation detected — state unchanged")
+    fs_ns = _get_mtime_ns('/tmp/FILESELECT')
+    cp_ns = _get_mtime_ns('/tmp/CURRENTPATH')
+    ag_ns = _get_mtime_ns('/tmp/ACTIVEGAME')
+
+    _NAV_COUPLING_MS = 50.0
+    delta_ms = abs(fs_ns - cp_ns) / 1e6
+
+    core_changed      = (corename != _last_evaluated_corename)
+    activegame_recent = (time.time_ns() - ag_ns) <= 3_000_000_000  # explicit launch (Remote/Zaparoo)
+
+    if delta_ms <= _NAV_COUPLING_MS and not core_changed and not activegame_recent:
+        print(f"🔀 OSD navigation detected (Δ={delta_ms:.2f} ms) — state unchanged")
         return
+
+    _last_evaluated_corename = corename
 
     # --- SAM detection (takes priority if active and current) ---
     if _sam_is_current():
         sam_active, sam_core_raw, sam_core_friendly, sam_game, sam_path = _sam_get_current()
         if sam_active and sam_core_raw:
             print(f"🎮 SAM active — core='{sam_core_friendly}' game='{sam_game}'")
-            with _state_lock:
-                _state['core']              = sam_core_friendly  # friendly — for display and image lookup
-                _state['system_name']       = sam_core_friendly
-                _state['game']              = sam_game
-                _state['game_path']         = sam_path
-                _state['is_arcade']         = False
-                _state['rom_details']       = None
-                _state['rom_details_stale'] = True
+            _commit_state(sam_core_friendly, sam_game, sam_path,
+                          is_arcade=False, event='sam')
             return
 
     # --- Menu ---
     if not corename or corename.upper() == 'MENU':
         print("📋 MENU detected")
-        with _state_lock:
-            _state['core']              = 'Menu'
-            _state['system_name']       = 'Menu'
-            _state['game']              = ''
-            _state['game_path']         = ''
-            _state['is_arcade']         = False
-            _state['rom_details']       = None
-            _state['rom_details_stale'] = True
+        _commit_state('Menu', '', '', is_arcade=False, event='menu')
         return
 
     # --- Resolve friendly core name ---
@@ -565,15 +677,42 @@ def _update_state():
                     corename)
     friendly_name = CORE_NAME_MAPPING.get(friendly_name, friendly_name)
 
+    if friendly_name == corename and '-' in corename:
+        prefix = corename.split('-', 1)[0]
+        prefix_friendly = (CORE_NAME_MAPPING.get(prefix) or
+                           CORE_NAME_MAPPING_LOWER.get(prefix.lower()))
+        if prefix_friendly:
+            print(f"🔧 MGL prefix '{prefix}' resolved to core '{prefix_friendly}'")
+            friendly_name = prefix_friendly
+
     # --- Arcade detection ---
     ARCADE_FRESHNESS = 30  # seconds
     corename_ts   = _get_mtime_ns('/tmp/CORENAME') / 1e9
     activegame_ts = _get_mtime_ns('/tmp/ACTIVEGAME') / 1e9
+    startpath_ts  = _get_mtime_ns('/tmp/STARTPATH') / 1e9
 
     activegame_arcade_fresh = (
         activegame and
         '/_Arcade/' in activegame and
         activegame_ts >= corename_ts - ARCADE_FRESHNESS
+    )
+
+    # STARTPATH points at the launched .mra for arcade cores. The .mra
+    # extension is arcade-exclusive and independent of the launch folder,
+    # so this catches arcades started from _@Favorites, custom folders,
+    # etc. — cases where FULLPATH doesn't contain "arcade". Freshness is
+    # checked against CORENAME so a stale STARTPATH from a previous arcade
+    # session doesn't misclassify a console game loaded afterwards.
+    startpath = ''
+    try:
+        with open('/tmp/STARTPATH', 'r') as f:
+            startpath = f.read().strip()
+    except Exception:
+        pass
+
+    startpath_arcade_fresh = (
+        startpath.lower().endswith('.mra') and
+        startpath_ts >= corename_ts - ARCADE_FRESHNESS
     )
 
     is_arcade = False
@@ -587,8 +726,16 @@ def _update_state():
         game_path = activegame
         print(f"🕹️ Arcade (Remote launch): {game_name}")
 
+    elif startpath_arcade_fresh:
+        # Arcade launched via OSD — detected by the .mra in STARTPATH,
+        # works regardless of the launch folder (_Arcade, _@Favorites, …).
+        is_arcade = True
+        game_name = _game_name_from_path(startpath)
+        game_path = startpath
+        print(f"🕹️ Arcade (OSD .mra launch): {game_name}")
+
     elif fullpath and 'arcade' in fullpath.lower() and not _is_known_non_arcade(corename):
-        # Arcade launched via OSD
+        # Arcade launched via OSD (legacy path-based detection, kept as fallback)
         is_arcade = True
         game_name = _game_name_from_path(currentpath)
         game_path = currentpath
@@ -636,24 +783,18 @@ def _update_state():
         
         print(f"🎮 Non-arcade: core={corename} game={game_name}")
 
-    with _state_lock:
-        _state['core']        = 'Arcade' if is_arcade else friendly_name  # friendly — for display and image lookup
-        _state['system_name'] = 'Arcade' if is_arcade else friendly_name
-        _state['game']              = game_name
-        _state['game_path']         = game_path
-        _state['is_arcade']         = is_arcade
-        _state['rom_details']       = None
-        _state['rom_details_stale'] = True
+    _commit_state('Arcade' if is_arcade else friendly_name,
+                  game_name, game_path, is_arcade,
+                  event='load' if game_name else 'core')
 
-    print(f"✅ State updated: core='{_state['core']}' game='{game_name}' arcade={is_arcade}")
+_SETTLE_SECONDS      = 0.4   # quiet time after the last event before evaluating
+_SAFETY_POLL_SECONDS = 15.0  # idle re-check; heals watcher restarts / lost events
 
-_last_event_time = 0.0
-_DEBOUNCE_SECONDS = 0.3
+_event_queue = queue.Queue()
 
 def _watcher_thread():
     """
-    Runs inotifywait in monitor mode and reacts to filesystem events.
-    Calls _update_state() whenever a relevant file changes.
+    Runs inotifywait in monitor mode and feeds raw events into _event_queue.
     Restarts automatically if inotifywait dies unexpectedly.
     """
     print("👁️ Watcher thread started")
@@ -671,29 +812,47 @@ def _watcher_thread():
                 if not line:
                     continue
                 print(f"📂 inotify event: {line}")
-
-                # CORENAME changes always trigger _update_state immediately
-                # Other events are debounced to avoid noise during navigation
-                is_corename = '/tmp/CORENAME' in line
-                
-                # Debounce: ignore events that arrive too close together
-                now = time.time()
-                global _last_event_time
-                if not is_corename and (now - _last_event_time < _DEBOUNCE_SECONDS):
-                    print(f"⏱️ Debounced")
-                    _last_event_time = now
-                    continue
-                _last_event_time = now
-                
-                _update_state()
+                _event_queue.put(line)
             proc.wait()
-            err = (proc.stderr.read() or '').strip()  # ← NUEVO
+            err = (proc.stderr.read() or '').strip()
             if err or proc.returncode not in (0, None):
                 print(f"⚠️ inotifywait exited (code={proc.returncode}): {err or 'no stderr'}")
         except Exception as e:
             print(f"⚠️ Watcher thread error: {e}")
         print("🔄 Watcher thread restarting...")
         time.sleep(1)
+
+def _evaluator_thread():
+    """
+    Consumes events and calls _update_state() exactly once per settled burst.
+    The last event of a burst (the real game load) can never be lost.
+    A low-frequency safety poll re-checks FILESELECT while idle, so a missed
+    inotify event (watcher restart, rare edge) can never freeze the state
+    permanently — the design guarantees eventual convergence.
+    """
+    print("🧠 Evaluator thread started")
+    pending = False
+    last_evaluated_fs_ns = 0
+    while True:
+        timeout = _SETTLE_SECONDS if pending else _SAFETY_POLL_SECONDS
+        try:
+            _event_queue.get(timeout=timeout)
+            pending = True          # burst open/extended — wait for quiet
+            continue
+        except queue.Empty:
+            pass                    # timeout: burst settled, or idle tick
+
+        if pending:
+            pending = False
+            _update_state()
+            last_evaluated_fs_ns = _get_mtime_ns('/tmp/FILESELECT')
+        else:
+            # Idle safety net: FILESELECT moved but was never evaluated
+            fs_ns = _get_mtime_ns('/tmp/FILESELECT')
+            if fs_ns > last_evaluated_fs_ns:
+                print("🛟 Safety poll: unevaluated FILESELECT change — evaluating")
+                _update_state()
+                last_evaluated_fs_ns = fs_ns
 
 # --- MiSTer Monitor UDP discovery responder -------------------------------
 DISCOVERY_PORT    = 51234
@@ -729,9 +888,9 @@ def _start_discovery_responder():
     threading.Thread(target=_run, daemon=True).start()
 
 def _start_watcher():
-    """Starts the background watcher thread as a daemon."""
-    t = threading.Thread(target=_watcher_thread, daemon=True)
-    t.start()
+    """Starts the watcher (inotify producer) and evaluator (consumer) daemons."""
+    threading.Thread(target=_watcher_thread, daemon=True).start()
+    threading.Thread(target=_evaluator_thread, daemon=True).start()
 
 # Session tracking — module-level so they persist across handler instances
 _session_start   = time.time()
@@ -802,6 +961,17 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 'last_valid_timestamp': last_valid_core_timestamp,
                 'timestamp': int(time.time())
             })
+        elif path == '/status/snapshot':
+            # Atomic identity snapshot. Optional ?seq=N: if the caller already
+            # has the current generation, reply with a tiny body so the ESP32
+            # skips re-parsing on the (common) no-change poll.
+            from urllib.parse import parse_qs
+            known_seq = parse_qs(parsed_path.query).get('seq', [None])[0]
+            snap = self.get_state_snapshot()
+            if known_seq is not None and known_seq == str(snap['seq']):
+                self.send_json_response({'seq': snap['seq'], 'unchanged': True})
+            else:
+                self.send_json_response(snap)
         elif path == '/status/all':
             status = {
                 'core': self.get_current_core(),
@@ -815,7 +985,8 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 'error_state': server_error_state,          # NEW
                 'has_error': bool(server_error_state),      # NEW
                 'last_valid_core': last_valid_core,         # NEW
-                'timestamp': int(time.time())
+                'timestamp': int(time.time()),
+                'snapshot': self.get_state_snapshot(),   # atomic identity block
             }
             self.send_json_response(status)
         else:
@@ -827,6 +998,29 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         """Returns the currently active core friendly name from centralized state."""
         with _state_lock:
             return _state['core']
+        
+    def get_state_snapshot(self):
+        """
+        Single-lock atomic snapshot of the core/game identity. This is what
+        the firmware polls: one request, one lock acquisition, one coherent
+        state. rom_details is the CACHED value only — never computed here
+        (computation stays on /status/rom/details, which can take minutes
+        for large CHDs).
+        """
+        with _state_lock:
+            return {
+                'seq':               _state['seq'],
+                'core':              _state['core'],
+                'system_name':       _state['system_name'],
+                'game':              _state['game'],
+                'game_path':         _state['game_path'],
+                'is_arcade':         _state['is_arcade'],
+                'rom_details_stale': _state['rom_details_stale'],
+                'rom_details':       _state['rom_details'],
+                'last_event':        _state['last_event'],
+                'updated_at':        _state['updated_at'],
+                'timestamp':         int(time.time()),
+            }
         
     def resolve_zip_path(self, zip_path):
         """
@@ -1286,8 +1480,9 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         print(f"[{time.strftime('%H:%M:%S')}] Getting ROM details...")
 
         with _state_lock:
-            stale   = _state['rom_details_stale']
-            cached  = _state['rom_details']
+            stale        = _state['rom_details_stale']
+            cached       = _state['rom_details']
+            seq_at_start = _state['seq']
 
         if not stale and cached is not None:
             print("📋 Using cached ROM details")
@@ -1323,9 +1518,14 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                     result = self.get_rom_details_from_file(rom_path)
                 result["detection_method"] = getattr(self, '_last_detection_method', 'unknown')
 
+            _enrich_rom_result(result)
+            result['seq'] = seq_at_start
             with _state_lock:
-                _state['rom_details']       = result
-                _state['rom_details_stale'] = False
+                if _state['seq'] == seq_at_start:
+                    _state['rom_details']       = result
+                    _state['rom_details_stale'] = False
+                else:
+                    print("⚠️ State changed during ROM hashing — result NOT cached (belongs to a previous game)")
 
             return result
     
@@ -1337,6 +1537,8 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         """
         print("🔄 === FORCED ROM DETAILS (bypass timestamp check) ===")
         try:
+            with _state_lock:
+                seq_at_start = _state['seq']
             corename = ""
             try:
                 with open('/tmp/CORENAME', 'r') as f:
@@ -1351,12 +1553,12 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 rom_path = self._get_non_arcade_rom_path()
 
             if not rom_path:
-                return {
+                return _enrich_rom_result({
                     "filename": "", "size": 0, "crc32": "", "md5": "", "sha1": "",
                     "path": "", "available": False,
                     "error": "Forced scan: no ROM path found via CURRENTPATH/ACTIVEGAME",
                     "detection_method": "forced_none", "timestamp": int(time.time())
-                }
+                })
 
             print(f"🔄 Forced path resolved: {rom_path}")
             is_zip, zip_path, internal_path = self.is_zip_path(rom_path)
@@ -1366,21 +1568,28 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 result = self.get_rom_details_from_file(rom_path)
 
             result["detection_method"] = "forced"
-            # Update cache so subsequent normal calls benefit from this result
+            _enrich_rom_result(result)
+            result['seq'] = seq_at_start
+            # Update cache so subsequent normal calls benefit — but only if the
+            # active game hasn't changed since we started hashing (a slow CHD
+            # hash could otherwise attach this result to a different game).
             with _state_lock:
-                _state['rom_details']       = result
-                _state['rom_details_stale'] = False
+                if _state['seq'] == seq_at_start:
+                    _state['rom_details']       = result
+                    _state['rom_details_stale'] = False
+                else:
+                    print("⚠️ State changed during forced ROM hashing — result NOT cached (belongs to a previous game)")
             return result
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return {
+            return _enrich_rom_result({
                 "filename": "", "size": 0, "crc32": "", "md5": "", "sha1": "",
                 "path": "", "available": False,
                 "error": f"Forced scan error: {str(e)}",
                 "detection_method": "forced_error", "timestamp": int(time.time())
-            }
+            })
 
     def _get_enhanced_rom_path(self):
         """
@@ -1625,15 +1834,18 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         print(f"📄 FULLPATH source:  '{fullpath}'")
 
         # When CURRENTPATH has no directory component, combine it with FULLPATH.
-        # This is the standard MiSTer pattern for games inside ZIP collections:
-        #   FULLPATH  = "games/Apple-II/Collection.zip/"  (directory context with ZIP)
-        #   CURRENTPATH = "221B Baker Street.do"           (just the filename)
-        # → combined = "games/Apple-II/Collection.zip/221B Baker Street.do"
         if currentpath and not os.path.dirname(currentpath) and fullpath:
             fullpath_dir = fullpath.rstrip('/')
-            combined = fullpath_dir + '/' + currentpath
-            print(f"🔗 CURRENTPATH has no directory - combining with FULLPATH: '{combined}'")
-            currentpath = combined
+            if os.path.basename(fullpath_dir) == currentpath:
+                # MGL/CHD launches: FULLPATH already carries the
+                # complete file path INCLUDING the filename — joining would
+                # duplicate it ('.../game.chd/game.chd'). Use it as-is.
+                print(f"🔗 FULLPATH already ends with CURRENTPATH - using it as-is: '{fullpath_dir}'")
+                currentpath = fullpath_dir
+            else:
+                combined = fullpath_dir + '/' + currentpath
+                print(f"🔗 CURRENTPATH has no directory - combining with FULLPATH: '{combined}'")
+                currentpath = combined
 
         # Determine preferred order by timestamp (same logic as get_current_game)
         activegame_is_newer = activegame_timestamp > currentpath_timestamp
@@ -1669,9 +1881,28 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                         print(f"❌ ZIP not found via {source_name}: {zip_path} - trying next source")
                         continue
                 else:
-                    if os.path.exists(final_path):
+                    if os.path.isfile(final_path):
                         print(f"✅ ROM file found via {source_name}: {final_path}")
                         return final_path
+                    elif os.path.isdir(final_path):
+                        # Folder-per-game layout: the game lives in a folder named
+                        # after it. os.path.exists()
+                        # is also true for directories, so without this branch the
+                        # server would try to hash the folder itself (Errno 21).
+                        print(f"📁 {source_name} resolved to a directory — searching disc image inside")
+                        try:
+                            entries = sorted(os.listdir(final_path))
+                        except Exception as e:
+                            print(f"❌ Cannot list directory: {e}")
+                            entries = []
+                        for ext in ('.chd', '.cue', '.iso', '.pbp'):
+                            matches = [f for f in entries if f.lower().endswith(ext)]
+                            if matches:
+                                chosen = os.path.join(final_path, matches[0])
+                                print(f"✅ Disc image found in folder ({source_name}): {chosen}")
+                                return chosen
+                        print(f"❌ No disc image inside directory: {final_path}")
+                        print(f"❌ Direct file not found: {final_path}")
                     else:
                         print(f"❌ Direct file not found: {final_path}")
 
@@ -1695,6 +1926,31 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                             print(f"✅ Same-name ZIP found ({source_name}): {virtual_path}")
                             return virtual_path
 
+                        # Title-based fallbacks: some cores (notably NEOGEO) write
+                        # the game's display TITLE to CURRENTPATH instead of the
+                        # filename on disk.
+
+                        # (a) Directory scan: a file whose name starts with the
+                        #     title and has a known ROM extension.
+                        try:
+                            entries = sorted(os.listdir(parent_dir))
+                        except Exception:
+                            entries = []
+                        title_l = target_filename.lower()
+                        for entry in entries:
+                            stem, ext = os.path.splitext(entry)
+                            if ext.lower() in _KNOWN_ROM_EXTS and stem.lower().startswith(title_l):
+                                candidate = os.path.join(parent_dir, entry)
+                                if os.path.isfile(candidate):
+                                    print(f"✅ Title-prefix match ({source_name}): {candidate}")
+                                    return candidate
+
+                        # (b) romsets.xml reverse lookup: display title -> romset
+                        #     name -> romset file (NEOGEO layouts).
+                        candidate = self._lookup_neogeo_romset(parent_dir, target_filename)
+                        if candidate:
+                            print(f"✅ romsets.xml match ({source_name}): {candidate}")
+                            return candidate
                         print(f"❌ No valid path found via {source_name} - trying next source")
                         continue
 
@@ -1704,7 +1960,73 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
 
         print(f"❌ No valid ROM path found from any source")
         return None
-        
+    
+    def _lookup_neogeo_romset(self, directory, title):
+        """
+        Reverse lookup in romsets.xml (NEOGEO): display title -> romset name.
+        The core shows the title from the .neo header / romsets.xml and writes
+        that TITLE to CURRENTPATH, so the file on disk (e.g. 'blazstar.neo')
+        can have a completely different name. Punctuation also differs between
+        sources (':' in the XML vs ' - ' in CURRENTPATH), so titles are
+        compared on their alphanumeric characters only.
+        """
+        xml_path = os.path.join(directory, 'romsets.xml')
+        if not os.path.isfile(xml_path):
+            return None
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.parse(xml_path).getroot()
+        except Exception as e:
+            print(f"⚠️ romsets.xml parse failed: {e}")
+            return None
+
+        def norm(s):
+            return re.sub(r'[^a-z0-9]', '', s.lower())
+
+        wanted = norm(title)
+        if not wanted:
+            return None
+        # Pass 1: exact match on normalized title (altname or romset name).
+        # Pass 2: prefix match. A prefix candidate only counts if its file
+        # actually exists on disk, and if more than one qualifies we refuse
+        # to guess.
+        exact_file = None
+        prefix_files = []
+        for rs in root.iter('romset'):
+            name    = rs.get('name') or ''
+            altname = rs.get('altname') or ''
+            norm_alt  = norm(altname)
+            norm_name = norm(name)
+
+            is_exact  = (norm_alt == wanted or norm_name == wanted)
+            is_prefix = (not is_exact and
+                         (norm_alt.startswith(wanted) or norm_name.startswith(wanted)))
+            if not (is_exact or is_prefix):
+                continue
+
+            found = None
+            for filename in (name + '.neo', name + '.zip'):
+                p = os.path.join(directory, filename)
+                if os.path.isfile(p):
+                    found = p
+                    break
+
+            if is_exact:
+                if found:
+                    return found
+                print(f"ℹ️ romsets.xml maps '{title}' -> '{name}' but no matching file on disk")
+                return None
+            if found:
+                prefix_files.append((name, found))
+
+        if len(prefix_files) == 1:
+            print(f"ℹ️ romsets.xml prefix match: '{title}' -> '{prefix_files[0][0]}'")
+            return prefix_files[0][1]
+        if len(prefix_files) > 1:
+            names = ', '.join(n for n, _ in prefix_files)
+            print(f"⚠️ romsets.xml: '{title}' is ambiguous ({names}) — not guessing")
+        return None
+
     def _resolve_mister_path(self, path):
         """
         Intelligently resolve MiSTer paths handling various relative path patterns
@@ -1720,12 +2042,14 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             print(f"✅ Already absolute: {resolved}")
             return resolved
         
-        # USB/external drives mount at /media/usbN, NOT under /media/fat.
-        # Resolve any leading ../ sequence pointing at usb0..usb7 correctly.
-        m = re.match(r'(?:\.\./)+(usb[0-7]/.*)$', path)
+        # Leading ../ sequences are relative to /media/fat, so '../usb0/...'
+        # means /media/usb0/... and '../fat/...' means /media/fat/... itself.
+        # Without this, the generic cleanup prepends /media/fat and produces
+        # /media/fat/fat/... (or /media/fat/usb0/...), which don't exist.
+        m = re.match(r'(?:\.\./)+((?:usb[0-7]|fat)/.*)$', path)
         if m:
             resolved = os.path.normpath('/media/' + m.group(1))
-            print(f"🔧 USB path resolved: {resolved}")
+            print(f"🔧 Relative /media path resolved: {resolved}")
             return resolved
         
         # Case 2: Starts with ../../../media/fat/ - remove the ../ and normalize
@@ -1804,7 +2128,15 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             # path pointing at something huge.
             MAX_SIZE_FOR_HASH = 1024 * 1024 * 1024  # 1GB
             
-            if file_size <= MAX_SIZE_FOR_HASH:
+            # Mutable containers (.vhd) are never worth hashing: ScreenScraper
+            # does not index them AND the guest OS rewrites them (save files),
+            # so their CRC is unstable by nature. Skip the minutes of
+            # CRC+MD5+SHA1 on the ARM entirely — same outcome as file_too_large.
+            skip_hash = os.path.splitext(filename)[1].lower() in _NO_HASH_EXTS
+
+            if skip_hash:
+                print(f"Hash skipped for {filename}: extension in _NO_HASH_EXTS (unindexable, mutable container)")
+            elif file_size <= MAX_SIZE_FOR_HASH:
                 try:
                     _wait_for_rom_load_to_settle()   # don't hash mid-load
 
@@ -2017,11 +2349,13 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
     # ========== HTTP RESPONSE HELPERS ==========
     
     def send_text_response(self, data):
+        body = str(data).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(str(data).encode('utf-8'))
+        self.wfile.write(body)
 
     def send_index_page(self):
         """Friendly landing page for humans hitting the server root.
@@ -2053,25 +2387,31 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             f'<ul>{rows}</ul>'
             '</body></html>'
         )
+        body = html.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(html.encode('utf-8'))
+        self.wfile.write(body)
     
     def send_json_response(self, data):
+        body = json.dumps(data).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode('utf-8'))
+        self.wfile.write(body)
     
     def send_error_response(self, code, message):
+        body = message.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(message.encode('utf-8'))
+        self.wfile.write(body)
 
 if __name__ == '__main__':
     try:
