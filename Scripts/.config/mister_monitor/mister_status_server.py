@@ -44,7 +44,7 @@ from urllib.parse import urlparse
 # is on disk. Bump this on every release, together with FIRMWARE_VERSION in
 # the sketches.
 # =============================================================================
-SERVER_VERSION = "2.7.1"
+SERVER_VERSION = "2.8.0"
 
 # RetroAchievements status resolver (sibling module). Imported lazily-safe:
 # if the file is missing the server still starts; the route reports the error.
@@ -237,6 +237,7 @@ CORE_NAME_MAPPING = {
     'NEOGEO': 'Neo-Geo',
     'NeoGeo-CD': 'Neo-Geo CD',
     'NeoGeoPocket': 'Neo-Geo Pocket',
+    'NeoGeoPocket-Color': 'Neo-Geo Pocket Color',
     'cdi':          'Philips CD-i',
     'colecovision': 'Colecovision',
     'jaguar':       'Atari Jaguar',
@@ -523,6 +524,8 @@ _state = {
                                    # when unknown (legacy paths) — consumers must fall back to 'core'.
     'system_name':       'Menu',   # alias of 'core' (same value); kept for backward compatibility
     'game_system':       '',       # the GAME's real system when a backwards-compatible core is running
+    'artwork_path':      '',       # absolute path of the pack image for the loaded game, '' when none
+    'artwork_seq':       -1,       # the seq that artwork_path was resolved for; a mismatch means stale
                                    # something older than itself (a Master System cartridge in the
                                    # MegaDrive core, a 2600 cartridge in the Atari 7800 core). Empty
                                    # whenever the game belongs to the core that opened it. 'core' stays
@@ -659,6 +662,10 @@ def _commit_state(core, game, game_path, is_arcade, event, core_raw='', game_sys
             _state['last_event']        = event
         seq_now = _state['seq']
     if changed:
+        # Resolve the pack image now, not when rom-details is computed: the
+        # display fetches artwork first, and a later resolution would serve
+        # the previous game's image.
+        _pack_resolve_for_state(game_path, is_arcade, game_system, core, seq_now)
         print(f"✅ State committed (seq={seq_now}, {event}): core='{core}' game='{game}' arcade={is_arcade}")
     else:
         print(f"♻️ Evaluation confirmed current state (seq={seq_now}) — rom cache preserved")
@@ -1266,6 +1273,21 @@ def _neogeo_romset_label(path, corename):
     return name if name in names else ''
 
 
+def _is_sd_root_file(path):
+    """True when the path is a file sitting directly in the card's root.
+
+    Root holds configuration, scripts and documentation; every game lives at
+    least one directory down. Both mount points are covered because a path can
+    be resolved through either.
+    """
+    try:
+        parent = os.path.dirname(os.path.normpath(path)).rstrip('/')
+    except Exception:
+        return False
+    return parent in ('/media/fat', '/media/usb0', '/media/usb1', '/media/usb2',
+                      '/media/usb3', '/media/usb4', '/media/usb5', '')
+
+
 def _neogeo_romset_dir(path, corename):
     """
     The romset id when `path` is a romset CONTAINER — an unzipped Darksoft
@@ -1497,6 +1519,267 @@ def _path_names_game(candidate, game):
     return False
 
 
+# ---------------------------------------------------------------------------
+# Boxart Pack — local artwork resolution
+#
+# The pack ships one image per GAME (not per dump) at
+# docs/<System>/Artwork/<key>.jpg, alongside an index.tsv whose rows are
+# (name, crc, size, key): every known dump of that game mapped to the image
+# that represents it. 'Super Mario World (Europe)' has no file of its own; the
+# index sends it to the (USA) image.
+#
+# Installed with path 'pext', so it may live on the SD or on any USB — the
+# mount points are probed, never assumed.
+# ---------------------------------------------------------------------------
+
+# Friendly system name -> pack folder. The friendly name is what
+# get_game_system() resolves: game_system when a backwards-compatible core
+# opened something older, the core's own name otherwise. Keying off core_raw
+# instead would send a Master System cartridge to the Genesis folder.
+#
+# Grows one line per system added to the builder's scope.ini. The two must
+# move together: a system present in one and absent from the other is a game
+# that silently falls through to ScreenScraper.
+_PACK_SYSTEM = {
+    'Nintendo NES/Famicom':            'NES',
+    'Famicom Disk System':             'FDS',
+    'Super Nintendo/Super Famicom':    'SNES',
+    'Nintendo 64':                     'N64',
+    'Nintendo Game Boy':               'GameBoy',
+    'Nintendo Game Boy Color':         'GameBoyColor',
+    'Nintendo Game Boy Advance':       'GBA',
+    'Nintendo Game Boy Advance 2P':    'GBA',
+    'Sega Genesis/Mega Drive':         'Genesis',
+    'Sega Master System':              'SMS',
+    'Sega Game Gear':                  'GameGear',
+    'Sega Mega-CD':                    'MegaCD',
+    'Sega Saturn':                     'Saturn',
+    'TurboGrafx-16/PC Engine':         'TGFX16',
+    'TurboGrafx-16/PC Engine CD-Rom':  'TGFX16-CD',
+    'Sony PlayStation':                'PSX',
+    'Atari 2600':                      'Atari2600',
+    'Atari 5200':                      'ATARI5200',
+    'Atari 7800':                      'ATARI7800',
+    'Atari Lynx':                      'AtariLynx',
+    'Atari Lynx (2P)':                 'AtariLynx',
+    'Atari Jaguar':                    'Jaguar',
+    'Neo-Geo':                         'NeoGeo',
+    'Nintendo Virtual Boy':            'VirtualBoy',
+    'Sega SG-1000':                    'SG-1000',
+    'Sega Genesis/Megadrive 32X':      'S32X',
+    'PC Engine SuperGrafx':            'SuperGrafx',
+    # The NGP/NGPC cores report these consoles without the hyphen.
+    'Neo-Geo Pocket':                  'NeoGeoPocket',
+    'Neo Geo Pocket':                  'NeoGeoPocket',
+    'Neo-Geo Pocket Color':            'NeoGeoPocket-Color',
+    'Neo Geo Pocket Color':            'NeoGeoPocket-Color',
+    'Bandai WonderSwan':               'WonderSwan',
+    'Bandai WonderSwan Color':         'WonderSwanColor',
+    'Colecovision':                    'Coleco',
+    'Mattel/INTV Intellivision':       'Intellivision',
+    'Vectrex':                         'VECTREX',
+    'Videopac G7000/Odyssey 2':        'ODYSSEY2',
+}
+
+_PACK_MOUNTS = ['/media/fat'] + ['/media/usb%d' % i for i in range(8)]
+
+# dir -> (mtime_ns, {name_lower: key}, {'crc:size': key}). Arcade's index is
+# 12k rows; parsing it on every game change would be pointless work, and the
+# file only changes when the Downloader rewrites it.
+_pack_index_cache = {}
+_pack_index_lock = threading.Lock()
+
+
+def _pack_dir(system_folder):
+    """Absolute path of the pack folder for a system, '' when not installed."""
+    if not system_folder:
+        return ''
+    for mount in _PACK_MOUNTS:
+        candidate = os.path.join(mount, 'docs', system_folder, 'Artwork')
+        if os.path.isdir(candidate):
+            return candidate
+    return ''
+
+
+def _pack_index(pack_dir):
+    """(by_name, by_hash) for a pack folder. Empty dicts when there is no
+    index.tsv — a pack built before the index existed still resolves by exact
+    filename, so a missing index degrades rather than breaks."""
+    index_path = os.path.join(pack_dir, 'index.tsv')
+    try:
+        stamp = os.stat(index_path).st_mtime_ns
+    except OSError:
+        return {}, {}
+
+    with _pack_index_lock:
+        cached = _pack_index_cache.get(pack_dir)
+        if cached and cached[0] == stamp:
+            return cached[1], cached[2]
+
+    by_name, by_hash = {}, {}
+    try:
+        with io.open(index_path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if not line or line[0] == '#':
+                    continue
+                parts = line.rstrip('\r\n').split('\t')
+                if len(parts) < 4:
+                    continue
+                name, crc, size, key = parts[0], parts[1], parts[2], parts[3]
+                if not key:
+                    continue
+                if name:
+                    by_name[name.strip().lower()] = key
+                # Arcade rows carry no crc or size: a MAME set is a zip of many
+                # files, so there is no single hash for the set. Those rows
+                # resolve by name only, which is exact anyway — the .mra
+                # setname IS the key space.
+                if crc and size:
+                    by_hash['%s:%s' % (crc.strip().lower(), size.strip())] = key
+    except Exception as e:
+        print("\u26a0\ufe0f pack index read failed: %s" % e)
+        return {}, {}
+
+    with _pack_index_lock:
+        _pack_index_cache[pack_dir] = (stamp, by_name, by_hash)
+    return by_name, by_hash
+
+
+def _pack_lookup(pack_dir, key, crc, size):
+    """(abs_path, resolved_key) for a game, ('', '') when the pack has no
+    image. Three steps, cheapest first:
+
+      1. the exact key as a filename — the common case, one stat();
+      2. the index by variant name — catches the user holding a dump the pack
+         did not pick as representative;
+      3. the index by crc+size — catches a renamed file, and costs nothing
+         extra because rom-details already computed the CRC.
+    """
+    if not pack_dir:
+        return '', ''
+
+    if key:
+        direct = os.path.join(pack_dir, key + '.jpg')
+        if os.path.isfile(direct):
+            return direct, key
+
+    by_name, by_hash = _pack_index(pack_dir)
+
+    if key:
+        mapped = by_name.get(key.strip().lower())
+        if mapped:
+            candidate = os.path.join(pack_dir, mapped + '.jpg')
+            if os.path.isfile(candidate):
+                return candidate, mapped
+
+    # The server formats CRC32 uppercase ('05FBB855'), the index stores it
+    # lowercase. Normalise both sides rather than trusting either.
+    if crc and size:
+        mapped = by_hash.get('%s:%s' % (str(crc).strip().lower(), str(size).strip()))
+        if mapped:
+            candidate = os.path.join(pack_dir, mapped + '.jpg')
+            if os.path.isfile(candidate):
+                return candidate, mapped
+
+    return '', ''
+
+
+def _pack_key_from_state(game_path, is_arcade):
+    """The pack key for the loaded game, derived from state ALONE.
+
+    Deliberately independent of rom-details: the display asks for artwork
+    before (and sometimes without) triggering a hash, so tying resolution to
+    rom-details left /media/artwork serving the PREVIOUS game's image. The
+    exact-filename step never needed the hash anyway — only the CRC fallback
+    does, and that runs later as a refinement.
+    """
+    if not game_path:
+        return ''
+    if is_arcade:
+        if game_path.lower().endswith('.mra'):
+            setname = _mra_setname(game_path).strip().lower()
+            if setname and re.match(r'^[a-z0-9][a-z0-9_-]*$', setname):
+                return setname
+        return ''
+    # Consoles: the No-Intro name without its extension. Zip-internal paths
+    # carry the real name at the end, so basename() covers them too.
+    return os.path.splitext(os.path.basename(game_path))[0]
+
+
+def _pack_resolve_for_state(game_path, is_arcade, game_system, core, seq):
+    """Resolves the pack image at state-commit time and records which seq it
+    belongs to. Called the moment the game changes, so /media/artwork is
+    correct before the display asks."""
+    path = ''
+    try:
+        system_folder = 'Arcade' if is_arcade else _PACK_SYSTEM.get(
+            game_system or core, '')
+        if system_folder:
+            key = _pack_key_from_state(game_path, is_arcade)
+            path, resolved = _pack_lookup(_pack_dir(system_folder), key, '', '')
+            if path:
+                print("\U0001f5bc\ufe0f local artwork: %s/%s.jpg" % (system_folder, resolved))
+    except Exception as e:
+        print("\u26a0\ufe0f local artwork lookup failed: %s" % e)
+    with _state_lock:
+        _state['artwork_path'] = path
+        _state['artwork_seq'] = seq
+
+
+def _pack_annotate(result):
+    """Adds artwork_local / artwork_key / artwork_system to a rom-details
+    result, and caches the resolved path for /media/artwork to serve.
+
+    Never raises: artwork is a nice-to-have and a pack problem must not be
+    able to break rom-details, which the firmware needs for everything else.
+    """
+    result['artwork_local'] = False
+    result['artwork_key'] = ''
+    result['artwork_system'] = ''
+    try:
+        with _state_lock:
+            is_arcade = _state['is_arcade']
+            friendly = _state['game_system'] or _state['core']
+            path_for_name = _state['game_path']
+
+        system_folder = 'Arcade' if is_arcade else _PACK_SYSTEM.get(friendly, '')
+        if not system_folder:
+            return result
+
+        if is_arcade:
+            # The .mra names its romset in <setname>, and that id is the pack's
+            # arcade key — the same identifier ss_romnom already extracts above.
+            arc_path = result.get('path') or path_for_name or ''
+            key = ''
+            if arc_path.lower().endswith('.mra'):
+                setname = _mra_setname(arc_path).strip().lower()
+                if setname and re.match(r'^[a-z0-9][a-z0-9_-]*$', setname):
+                    key = setname
+        else:
+            # Consoles: the No-Intro name without its extension.
+            key = os.path.splitext(result.get('filename') or '')[0]
+
+        pack_dir = _pack_dir(system_folder)
+        found, resolved = _pack_lookup(pack_dir, key,
+                                       result.get('crc32'), result.get('size'))
+        result['artwork_system'] = system_folder
+        if found:
+            result['artwork_local'] = True
+            result['artwork_key'] = resolved
+            # Only ever UPGRADES what the state commit already resolved: the
+            # CRC step can find an image the name step missed, but a miss here
+            # must not wipe a good path (this runs per rom-details request,
+            # while the commit runs once per game).
+            with _state_lock:
+                if _state['artwork_path'] != found:
+                    _state['artwork_path'] = found
+                    _state['artwork_seq'] = _state['seq']
+            print("\U0001f5bc\ufe0f local artwork: %s/%s.jpg" % (system_folder, resolved))
+    except Exception as e:
+        print("\u26a0\ufe0f local artwork lookup failed: %s" % e)
+    return result
+
+
 def _enrich_rom_result(result, detection_method=None):
     """
     Adds name-search metadata to a rom-details result (success OR failure):
@@ -1596,6 +1879,10 @@ def _enrich_rom_result(result, detection_method=None):
     # file (available=True) and whose name search must run — hence keying
     # on detection_method, not on available alone.
     result['no_rom_on_disk'] = bool(detection_method == 'sam_no_path')
+
+    # Local-first artwork. Runs last: it consumes filename, crc32 and
+    # size, all of which the block above has already settled.
+    _pack_annotate(result)
     return result
 
 # ---------------------------------------------------------------------------
@@ -2001,6 +2288,29 @@ def _update_state():
                                      or ag_zip_is_folder)
                                 and not _neogeo_romset_dir(ag_probe, corename))
 
+        # Same verdict for CURRENTPATH, which had none. Browsing the OSD into
+        # a game folder leaves the FOLDER here, and the fallback at the end of
+        # the chain minted it as a game: browsing games/NeoGeoPocket under the
+        # NeoGeoPocket-Color core committed game='NeoGeoPocket', a title that
+        # does not exist. The core-name test above could not catch it -- the
+        # folder matches neither 'NeoGeoPocket-Color' nor 'Neo-Geo Pocket' --
+        # so the fact that it IS a directory is the only reliable witness, and
+        # rom-details already reaches that same verdict, just too late to stop
+        # the commit.
+        cp_probe = ((cp_composed if cp_composed.startswith('/')
+                     else os.path.join('/media/fat', cp_composed))
+                    if cp_composed else '')
+        cp_zip_rel, cp_zip_internal = _zip_split(cp_composed)
+        cp_zip_is_folder = False
+        if cp_zip_rel and cp_zip_internal:
+            _cp_zip_abs = (cp_zip_rel if cp_zip_rel.startswith('/')
+                           else os.path.join('/media/fat', cp_zip_rel))
+            cp_zip_is_folder = _zip_internal_is_folder(_cp_zip_abs,
+                                                       cp_zip_internal)
+        cp_is_folder = (bool(cp_composed) and not cp_is_system
+                        and (os.path.isdir(cp_probe) or cp_zip_is_folder)
+                        and not _neogeo_romset_dir(cp_probe, corename))
+
         selected_launch = None            # (game_name, game_path) or None
         if (fileselect_fresh and currentpath
                 and not currentpath_is_core_name):
@@ -2142,8 +2452,13 @@ def _update_state():
                 # a slash ('Metal Slug 2: Super Vehicle-001/II'), which any
                 # path-aware helper would truncate to the last segment.
                 game_name = currentpath.strip()
+        # Folder gate mirrors the ACTIVEGAME branch above, core_changed clause
+        # included: on a genuinely NEW core a folder may still establish
+        # identity (degraded but pre-existing behaviour), while during an
+        # unchanged core -- plain OSD browsing -- it never may.
         elif (currentpath and not currentpath.lower().endswith('.ini')
-              and not cp_is_system):
+              and not cp_is_system
+              and not (cp_is_folder and not core_changed)):
             game_name = _game_name_from_path(currentpath)
             game_path = cp_composed
         else:
@@ -2427,6 +2742,12 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 self.send_json_response(self.get_rom_details_forced())
             else:
                 self.send_json_response(self.get_rom_details())
+        elif path == '/media/artwork':
+            # Serves the pack image for the loaded game. The display cannot
+            # read the MiSTer's SD, so the path alone would be useless: the
+            # bytes have to travel. 404 means "no local image" — the firmware
+            # then falls back to ScreenScraper exactly as it always has.
+            self.send_artwork_response()
         elif path == '/status/error_state':
             # NEW ENDPOINT: Return current error state
             global server_error_state, last_valid_core, last_valid_core_timestamp
@@ -3499,6 +3820,15 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                         print(f"❌ ZIP not found via {source_name}: {zip_path} - trying next source")
                         continue
                 else:
+                    if os.path.isfile(final_path) and _is_sd_root_file(final_path):
+                        # A game is never loose in the card's root; that is where
+                        # MiSTer.ini, scripts and readmes live. Reached when a bare
+                        # name picks up a ROM extension by accident -- 'ROMS' under
+                        # the MegaDrive core resolving to the readme ROMS.md, which
+                        # would otherwise be hashed and passed off as a real game.
+                        print(f"🛡️ {source_name} resolved into the SD root, not a "
+                              f"game: {final_path}")
+                        continue
                     if os.path.isfile(final_path):
                         print(f"✅ ROM file found via {source_name}: {final_path}")
                         return final_path
@@ -3946,6 +4276,14 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
                 "timestamp": int(time.time())
             }
         
+        # Some cores report the archive alone for a single-ROM zip. Resolve it to
+        # the sole member so the strategies and the RA layer see a normal member.
+        if not internal_path:
+            _members, _, _ = _zip_entries(resolved_zip_path)
+            if len(_members) == 1:
+                internal_path = next(iter(_members.values()))
+                print(f"📦 Sole member resolved: {internal_path}")
+
         try:
             print(f"📂 Opening ZIP: {resolved_zip_path}")
             
@@ -4058,6 +4396,43 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
 
     # ========== HTTP RESPONSE HELPERS ==========
     
+    def send_artwork_response(self):
+        """Sends the pack image for the loaded game, or 404.
+
+        The path is resolved during rom-details, not here: this handler must
+        stay cheap enough for the display to hit it on every game change.
+        Content-Length is mandatory — the ESP32 HTTP client needs it to size
+        its read, and a chunked reply would stall the decoder.
+        """
+        with _state_lock:
+            artwork_path = _state.get('artwork_path', '')
+            fresh = (_state.get('artwork_seq', -1) == _state['seq'])
+
+        # Serving an image resolved for a PREVIOUS game is worse than serving
+        # none: the display would cache confident-looking wrong artwork under
+        # the current game's name. 404 sends it to ScreenScraper instead.
+        if not fresh:
+            self.send_error_response(404, 'Artwork not resolved for the current game')
+            return
+
+        if not artwork_path or not os.path.isfile(artwork_path):
+            self.send_error_response(404, 'No local artwork for the loaded game')
+            return
+
+        try:
+            with open(artwork_path, 'rb') as f:
+                body = f.read()
+        except OSError as e:
+            self.send_error_response(500, 'Artwork unreadable: %s' % e)
+            return
+
+        self.send_response(200)
+        self.send_header('Content-type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_text_response(self, data):
         body = str(data).encode('utf-8')
         self.send_response(200)
@@ -4086,6 +4461,7 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
             ('/status/session', 'Session statistics'),
             ('/status/all', 'All data combined'),
             ('/status/unknown_cores', 'Cores this MiSTer ran that we cannot name'),
+            ('/media/artwork', 'Artwork for the loaded game, from the installed pack'),
         ]
         rows = ''.join(
             f'<li><a href="{p}">{p}</a> — {d}</li>' for p, d in endpoints
