@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 # /status/version. Bump on every release, together with FIRMWARE_VERSION in
 # the sketches.
 # =============================================================================
-SERVER_VERSION = "2.9.0"
+SERVER_VERSION = "2.10.0"
 
 # RetroAchievements resolver (optional sibling module): if it is missing the
 # server still starts and the route reports the error.
@@ -1072,6 +1072,54 @@ def _load_romset_names(directory):
     return frozen
 
 
+_romset_title_cache = {}              # directory -> (mtime_stamp, {id: title})
+
+
+def _neogeo_romset_title(directory, romset):
+    """
+    Display title of a romset id, from the same data files the core reads.
+    The OSD browser shows this title and leaves it in CURRENTPATH; a launcher
+    that skips the browser leaves the id, and the panel should not.
+    """
+    if not directory or not romset or not os.path.isdir(directory):
+        return ''
+    paths = [os.path.join(directory, n) for n in _ROMSET_XML_NAMES]
+    try:
+        stamp = tuple(os.path.getmtime(p) if os.path.isfile(p) else 0
+                      for p in paths)
+    except Exception:
+        return ''
+    if not any(stamp):
+        return ''
+
+    with _romset_cache_lock:
+        cached = _romset_title_cache.get(directory)
+        if cached and cached[0] == stamp:
+            return cached[1].get(romset.strip().lower(), '')
+
+    import xml.etree.ElementTree as ET
+    titles = {}
+    for p in paths:
+        if not os.path.isfile(p):
+            continue
+        try:
+            root = ET.parse(p).getroot()
+        except Exception:
+            continue
+        for rs in root.iter('romset'):
+            title = (rs.get('altname') or '').strip()
+            if not title:
+                continue
+            for alias in (rs.get('name') or '').split(','):
+                alias = alias.strip().lower()
+                if alias:
+                    titles.setdefault(alias, title)
+
+    with _romset_cache_lock:
+        _romset_title_cache[directory] = (stamp, titles)
+    return titles.get(romset.strip().lower(), '')
+
+
 def _neogeo_games_dir(rom_path):
     """
     The directory holding romsets.xml for this ROM. The ROM can be nested while
@@ -2016,6 +2064,22 @@ def _deref_launcher_mgl(path, label='ACTIVEGAME'):
     return target
 
 
+_LAUNCH_MGL = '/media/fat/.LASTLAUNCH.mgl'
+
+
+def _scratch_mgl_game(corename_ts):
+    """
+    The game named by the scratch MGL at the card root, when that MGL was
+    written for the current core load. Console Mode launches through it and
+    announces nothing else, so the MGL is the only witness; the window keeps
+    one left by an earlier launcher out. FAT rounds mtimes to 2 s.
+    """
+    mgl_ts = _get_mtime_ns(_LAUNCH_MGL) / 1e9
+    if not mgl_ts or not (corename_ts - 30 <= mgl_ts <= corename_ts + 5):
+        return ''
+    return _mgl_target(_LAUNCH_MGL)
+
+
 def _game_name_from_path(path):
     """
     Extracts the game name from a file path. Only strips the extension when it
@@ -2385,6 +2449,8 @@ def _update_state():
             # romsets.xml. Show the title (also what ScreenScraper searches on);
             # the path stays on ACTIVEGAME, which is what exists on disk.
             if (currentpath and currentpath != game_name and
+                    os.path.splitext(currentpath)[1].lower()
+                    not in _KNOWN_ROM_EXTS and
                     _neogeo_romset_label(_resolve_neogeo_probe(activegame),
                                        corename)):
                 print(f"🎯 NeoGeo romset folder: showing title "
@@ -2401,8 +2467,10 @@ def _update_state():
             game_name = _game_name_from_path(currentpath)
             game_path = cp_composed
         else:
-            game_name = ''
-            game_path = ''
+            game_path = _scratch_mgl_game(corename_ts)
+            game_name = _game_name_from_path(game_path)
+            if game_name:
+                print(f"🔗 Scratch MGL is the only witness: '{game_path}'")
 
         # Every source rejected as a system path leaves game_name empty, but on
         # a genuinely new core that emptiness is the truth, while on an unchanged
@@ -2416,6 +2484,19 @@ def _update_state():
                 game_path = _state['game_path']
             if game_name:
                 print("🛡️ Only system paths on offer — keeping current game")
+
+        # NeoGeo: whichever source won, an id on the panel means no browser
+        # supplied the title. romsets.xml has it.
+        if game_name and game_path:
+            romset = _neogeo_romset_label(_resolve_neogeo_probe(game_path),
+                                          corename)
+            if romset and game_name.strip().lower() == romset:
+                title = _neogeo_romset_title(_neogeo_games_dir(game_path),
+                                             romset)
+                if title:
+                    print(f"🎯 NeoGeo title from romsets.xml: "
+                          f"'{title}' for romset '{romset}'")
+                    game_name = title
 
         print(f"🎮 Non-arcade: core={corename} game={game_name}")
 
@@ -2577,6 +2658,33 @@ def _start_watcher():
 # Session tracking — module-level so they persist across handler instances
 _session_start   = time.time()
 _requests_count  = 0
+
+# Endpoint list shown to a human. The startup banner and the HTML index page
+# both read from here, so the two cannot drift apart again — they already had:
+# the banner listed the RetroAchievements endpoints, the index page did not.
+#
+# Inclusion criterion, from send_index_page's own docstring: that page exists so
+# a manual connectivity test sees something reassuring. It is a browser landing
+# page, not API documentation — so endpoints that need query parameters or
+# return machine-only counters stay out (/status/snapshot,
+# /status/retroachievements/event, /status/retroachievements/achievements).
+PUBLIC_ENDPOINTS = [
+    ('/status/core',              'Active core'),
+    ('/status/game',              'Active game'),
+    ('/status/rom',               'Loaded ROM'),
+    ('/status/rom/details',       'ROM details (CRC, hash, path)'),
+    ('/status/system',            'CPU, memory, uptime'),
+    ('/status/storage',           'SD / USB storage'),
+    ('/status/network',           'Network status'),
+    ('/status/usb',               'USB devices'),
+    ('/status/session',           'Session statistics'),
+    ('/status/retroachievements', 'RetroAchievements progress for the active game'),
+    ('/status/all',               'All data combined'),
+    ('/status/unknown_cores',     'Cores this MiSTer ran that we cannot name'),
+    ('/status/error_state',       'Current error state (troubleshooting)'),
+    ('/status/version',           'Server version'),
+    ('/media/artwork',            'Artwork for the loaded game, from the installed pack'),
+]
 
 class MiSTerStatusHandler(BaseHTTPRequestHandler):
 
@@ -4321,22 +4429,8 @@ class MiSTerStatusHandler(BaseHTTPRequestHandler):
         """Landing page for humans hitting the server root. The display never
         calls '/'; this exists so a manual connectivity test returns something
         reassuring instead of a 404 that looks like a failure."""
-        endpoints = [
-            ('/status/core', 'Active core'),
-            ('/status/game', 'Active game'),
-            ('/status/rom', 'Loaded ROM'),
-            ('/status/rom/details', 'ROM details (CRC, hash, path)'),
-            ('/status/system', 'CPU, memory, uptime'),
-            ('/status/storage', 'SD / USB storage'),
-            ('/status/network', 'Network status'),
-            ('/status/usb', 'USB devices'),
-            ('/status/session', 'Session statistics'),
-            ('/status/all', 'All data combined'),
-            ('/status/unknown_cores', 'Cores this MiSTer ran that we cannot name'),
-            ('/media/artwork', 'Artwork for the loaded game, from the installed pack'),
-        ]
         rows = ''.join(
-            f'<li><a href="{p}">{p}</a> — {d}</li>' for p, d in endpoints
+            f'<li><a href="{p}">{p}</a> — {d}</li>' for p, d in PUBLIC_ENDPOINTS
         )
         html = (
             '<!DOCTYPE html><html><head><meta charset="utf-8">'
@@ -4383,21 +4477,15 @@ if __name__ == '__main__':
                 print(f"ℹ️ RA polling not started: {e}")
         server = ThreadingHTTPServer(('', 8081), MiSTerStatusHandler)
         print("MiSTer Monitor Status Server v2 - port 8081")
+        print(f"Version: {SERVER_VERSION}")
         print("Endpoints:")
-        print("  /status/core         - Active core")
-        print("  /status/game         - Active game")
-        print("  /status/rom          - Loaded ROM")
-        print("  /status/rom/details  - ROM details (CRC, hash, path)")
-        print("  /status/system       - CPU, memory, uptime")
-        print("  /status/storage      - SD/USB storage")
-        print("  /status/network      - Network status")
-        print("  /status/usb          - USB devices")
-        print("  /status/session      - Session statistics")
-        print("  /status/all          - All data combined")
-        print("  /status/retroachievements - RA progress for active game")
+        for _p, _d in PUBLIC_ENDPOINTS:
+            print(f"  {_p:<26} - {_d}")
+        # Parameterised endpoints: useful when debugging the server, but not
+        # worth listing on the browser page, where they cannot be clicked.
         print("  /status/retroachievements/event - unlock counter micro-poll")
         print("  /status/retroachievements/achievements - trophy list (?page=N&per=M)")
-        print("  /status/unknown_cores - cores this MiSTer ran that we cannot name")
+        print("  /status/snapshot - atomic identity snapshot (?seq=N)")
         print("")
         server.serve_forever()
     except Exception as e:
