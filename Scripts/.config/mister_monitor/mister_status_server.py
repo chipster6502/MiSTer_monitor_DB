@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 # /status/version. Bump on every release, together with FIRMWARE_VERSION in
 # the sketches.
 # =============================================================================
-SERVER_VERSION = "2.10.0"
+SERVER_VERSION = "2.11.0"
 
 # RetroAchievements resolver (optional sibling module): if it is missing the
 # server still starts and the route reports the error.
@@ -296,6 +296,23 @@ CORE_NAME_MAPPING = {
     'VECTOR06': 'Vector-06C',
     'VT52': 'DEC VT52',
     '3DO': '3DO Interactive Multiplayer',
+    'CBM-II': 'Commodore CBM-II',
+    'FM-7': 'Fujitsu FM-7',
+    'Gamecom': 'Tiger Game.com',
+    'GameKing': 'TimeTop GameKing',
+    'JR100': 'National JR-100',
+    'Loopy': 'Casio Loopy',
+    'NeXT': 'NeXT Computer',
+    'PocketStation': 'Sony PocketStation',
+    'SGIIndy': 'SGI Indy',
+    'Studio-II': 'RCA Studio II',
+    'SuperAcan': 'Funtech Super Acan',
+
+    # Reported by the runtime unknown-core log. The CORENAME here is the
+    # literal string the core wrote, which the .rbf name does not always give.
+    'ABC80': 'Luxor ABC 80',
+    'Amstrad PCW': 'Amstrad PCW',
+    'Tamagotchi': 'Tamagotchi',
 }
 
 # names.txt only names cores the curated table does not know. Lookups are
@@ -2472,18 +2489,22 @@ def _update_state():
             if game_name:
                 print(f"🔗 Scratch MGL is the only witness: '{game_path}'")
 
-        # Every source rejected as a system path leaves game_name empty, but on
-        # a genuinely new core that emptiness is the truth, while on an unchanged
-        # core (a script or cheat picked during play) blanking would wipe the
-        # panel mid-session — so the current identity is re-asserted instead.
+        # Every source rejected as a system path or as a folder leaves
+        # game_name empty, but on a genuinely new core that emptiness is the
+        # truth, while on an unchanged core (a script or cheat picked during
+        # play, or the game folder a folder launch leaves in CURRENTPATH once
+        # the OSD rewrites FILESELECT) blanking would wipe the panel
+        # mid-session — so the current identity is re-asserted instead.
         if (not game_name and not currentpath_is_core_name
-                and (activegame_is_system or cp_is_system)
+                and (activegame_is_system or cp_is_system
+                     or activegame_is_folder or cp_is_folder)
                 and not core_changed):
             with _state_lock:
                 game_name = _state['game']
                 game_path = _state['game_path']
             if game_name:
-                print("🛡️ Only system paths on offer — keeping current game")
+                print("🛡️ Only system paths or folders on offer — "
+                      "keeping current game")
 
         # NeoGeo: whichever source won, an id on the panel means no browser
         # supplied the title. romsets.xml has it.
