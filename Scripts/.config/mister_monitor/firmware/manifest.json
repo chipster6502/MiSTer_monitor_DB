@@ -1,0 +1,45 @@
+{
+  "version": "2.12.0",
+  "boards": {
+    "cyd35c": {
+      "file": "cyd35c.bin",
+      "size": 1537984,
+      "md5": "cfe441f175b452f435d6e60c631c38f0"
+    },
+    "cyd35r": {
+      "file": "cyd35r.bin",
+      "size": 1522864,
+      "md5": "e618e6733e45dc0286c2f67d2005da3e"
+    },
+    "cyd_ili9341": {
+      "file": "cyd_ili9341.bin",
+      "size": 1519120,
+      "md5": "45fb463216246d4a9264c8951f514260"
+    },
+    "cyd_st7789": {
+      "file": "cyd_st7789.bin",
+      "size": 1519088,
+      "md5": "98eb1cdb2ca52898ea1ef2ffdcd78e17"
+    },
+    "guition10inch": {
+      "file": "guition10inch.bin",
+      "size": 1701168,
+      "md5": "9c55babbc8d6c6d843957c41905dde5e"
+    },
+    "guition10inch_v3": {
+      "file": "guition10inch_v3.bin",
+      "size": 1703296,
+      "md5": "6fe01636642720f9de32957a1e19ceb8"
+    },
+    "tab5": {
+      "file": "tab5.bin",
+      "size": 1703328,
+      "md5": "ac16c903f94b5487b54bdf0463f7f3ae"
+    },
+    "waveshare28": {
+      "file": "waveshare28.bin",
+      "size": 1531344,
+      "md5": "889657a5e266ef255852c42e7e2d7418"
+    }
+  }
+}
